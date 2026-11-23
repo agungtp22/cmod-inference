@@ -1,0 +1,43 @@
+services:
+  llama-cpu:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    command:
+      - -m
+      - /models/${GGUF_MODEL_FILE:-model-q4_k_m.gguf}
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --ctx-size
+      - ${CMOD_INFERENCE_MAX_MODEL_LEN:-16384}
+      - --parallel
+      - "2"
+      - -ngl
+      - "0"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+      - --jinja
+
+  cmod-inference:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    restart: unless-stopped
+    depends_on:
+      - llama-cpu
+    ports:
+      - "8790:8790"
+    environment:
+      CMOD_INFERENCE_BIND: "0.0.0.0"
+      CMOD_INFERENCE_PORT: "8790"
+      CMOD_INFERENCE_API_KEYS: "${CMOD_INFERENCE_API_KEYS:?Set CMOD_INFERENCE_API_KEYS sebelum menjalankan di LAN}"
+      CMOD_INFERENCE_BACKEND: "llamacpp"
+      CMOD_INFERENCE_UPSTREAM_URL: "http://llama-cpu:8080/v1"
+      CMOD_INFERENCE_MODEL: "${CMOD_INFERENCE_MODEL:-cmod-doc-extract}"
+      CMOD_INFERENCE_MAX_MODEL_LEN: "${CMOD_INFERENCE_MAX_MODEL_LEN:-16384}"
+      CMOD_INFERENCE_LOG_PROMPTS: "false"

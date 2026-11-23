@@ -1,0 +1,19 @@
+# Pattern 1: Multi-Node Horizontal Cluster Router (Prefix-Aware + Model Routing + Failover)
+# Point CMOD_INFERENCE_CLUSTER_NODES to your LAN machines running `cmod-inference serve`.
+# Format: "http://<ip1>:8790/v1|modelA,http://<ip2>:8790/v1|modelB" (omit |model for wildcard pool).
+
+services:
+  cmod-cluster-router:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    ports:
+      - "8790:8790"
+    environment:
+      - CMOD_INFERENCE_BIND=0.0.0.0
+      - CMOD_INFERENCE_PORT=8790
+      - CMOD_INFERENCE_API_KEYS=${CMOD_INFERENCE_API_KEYS:-change-me-in-production}
+      - CMOD_INFERENCE_BACKEND=cluster
+      - CMOD_INFERENCE_CLUSTER_NODES=${CMOD_INFERENCE_CLUSTER_NODES:-http://192.168.1.10:8790/v1|qwen3-14b-doc,http://192.168.1.11:8790/v1|gemma-4-e4b-vlm}
+      - CMOD_INFERENCE_UPSTREAM_API_KEY=${CMOD_NODE_API_KEY:-}
+      - CMOD_INFERENCE_MODEL=${CMOD_DEFAULT_MODEL:-qwen3-14b-doc}

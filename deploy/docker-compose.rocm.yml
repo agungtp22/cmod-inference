@@ -1,0 +1,47 @@
+services:
+  vllm-rocm:
+    image: rocm/vllm:latest
+    restart: unless-stopped
+    ipc: host
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      HF_HOME: /models/hf
+    volumes:
+      - ./models:/models
+    command:
+      - vllm
+      - serve
+      - ${VLLM_MODEL:-Qwen/Qwen2.5-14B-Instruct}
+      - --max-model-len
+      - ${CMOD_INFERENCE_MAX_MODEL_LEN:-32768}
+      - --enable-prefix-caching
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - hermes
+      - --port
+      - "8000"
+
+  cmod-inference:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    restart: unless-stopped
+    depends_on:
+      - vllm-rocm
+    ports:
+      - "8790:8790"
+    environment:
+      CMOD_INFERENCE_BIND: "0.0.0.0"
+      CMOD_INFERENCE_PORT: "8790"
+      CMOD_INFERENCE_API_KEYS: "${CMOD_INFERENCE_API_KEYS:?Set CMOD_INFERENCE_API_KEYS sebelum menjalankan di LAN}"
+      CMOD_INFERENCE_BACKEND: "vllm"
+      CMOD_INFERENCE_UPSTREAM_URL: "http://vllm-rocm:8000/v1"
+      CMOD_INFERENCE_MODEL: "${VLLM_MODEL:-Qwen/Qwen2.5-14B-Instruct}"
+      CMOD_INFERENCE_MAX_MODEL_LEN: "${CMOD_INFERENCE_MAX_MODEL_LEN:-32768}"
+      CMOD_INFERENCE_LOG_PROMPTS: "false"

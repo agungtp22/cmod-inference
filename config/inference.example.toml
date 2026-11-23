@@ -1,0 +1,33 @@
+[server]
+bind = "127.0.0.1"
+port = 8790
+# Wajib diisi saat bind ke 0.0.0.0 (LAN) agar tidak terbuka tanpa autentikasi.
+api_keys = []
+allow_unauthenticated_lan = false
+log_prompts = false
+
+[backend]
+# Pilihan: "auto" | "vllm" | "llamacpp" | "passthrough"
+kind = "passthrough"
+# URL backend OpenAI-compatible (mis. vLLM di port 8000 atau llama-server di port 8080)
+upstream_url = "http://127.0.0.1:8080/v1"
+upstream_api_key = ""
+# Nama model default yang diekspos ke klien
+model = "cmod-doc-extract"
+# Batas maksimal context window server (mencegah pemotongan diam-diam)
+max_model_len = 32768
+# Aktifkan bila ingin gateway mensupervisi proses llama-server lokal otomatis
+manage_local_process = false
+llama_server_bin = "llama-server"
+model_path = ""
+mmproj_path = ""
+gpu_layers = -1
+kv_cache_quant = "q8_0"
+parallel_slots = 4
+# Opsional untuk model MoE pada server RAM besar + 1 GPU:
+moe_cpu_offload = false
+
+[scheduler]
+interactive_slots = 6
+batch_slots = 2
+queue_timeout_secs = 120

@@ -1,0 +1,55 @@
+[[presets]]
+id = "cmod-doc-extract"
+label = "Document Extraction & Mapping (Non-Thinking)"
+purpose = "Ekstraksi JSON terstruktur & pemetaan katalog deterministik"
+recommended_models = ["Qwen2.5-14B-Instruct", "Qwen3-30B-A3B-Instruct"]
+architecture = "dense_or_moe"
+multimodal = false
+min_quant = "Q4_K_M / AWQ / FP8"
+kv_cache_quant = "q8_0"
+default_temperature = 0.0
+non_thinking = true
+min_context_len = 16384
+recommended_context_len = 32768
+
+[[presets]]
+id = "cmod-doc-chat"
+label = "Cited Document Q&A (Long Context)"
+purpose = "Tanya jawab lintas halaman bersitasi [Halaman N] & ringkasan dokumen"
+recommended_models = ["Qwen2.5-14B-Instruct", "Qwen2.5-32B-Instruct", "Qwen3-30B-A3B"]
+architecture = "dense_or_moe"
+multimodal = false
+min_quant = "Q4_K_M / AWQ / FP8"
+kv_cache_quant = "q8_0"
+default_temperature = 0.1
+non_thinking = false
+min_context_len = 32768
+recommended_context_len = 65536
+
+[[presets]]
+id = "cmod-doc-vision"
+label = "Multimodal Document VLM (Local On-Prem)"
+purpose = "Halaman tabel rumit, formulir scan padat, atau lampiran visual lokal"
+recommended_models = ["Qwen2.5-VL-7B-Instruct", "Qwen2.5-VL-32B-Instruct", "Gemma-3-12B-IT"]
+architecture = "vlm"
+multimodal = true
+min_quant = "Q4_K_M / FP8 (+ mmproj)"
+kv_cache_quant = "q8_0"
+default_temperature = 0.0
+non_thinking = true
+min_context_len = 16384
+recommended_context_len = 32768
+
+[[presets]]
+id = "cmod-doc-moe"
+label = "High-Throughput MoE Server"
+purpose = "Throughput tinggi dengan total parameter besar & active parameter kecil"
+recommended_models = ["Qwen3-30B-A3B-Instruct", "Qwen3-235B-A22B"]
+architecture = "moe"
+multimodal = false
+min_quant = "Q4_K_M / UD-Q4_K_XL / FP8"
+kv_cache_quant = "q8_0"
+default_temperature = 0.0
+non_thinking = true
+min_context_len = 32768
+recommended_context_len = 65536

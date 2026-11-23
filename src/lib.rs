@@ -1,0 +1,59 @@
+pub mod auth;
+pub mod backend;
+pub mod cache;
+pub mod config;
+pub mod control;
+pub mod hardware;
+pub mod ir;
+pub mod models;
+pub mod presets;
+pub mod protocol;
+pub mod scheduler;
+
+use std::sync::Arc;
+
+use axum::routing::{get, post};
+use axum::Router;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+
+use crate::backend::InferenceBackend;
+use crate::cache::TieredKvCache;
+use crate::config::InferenceConfig;
+use crate::hardware::HardwareReport;
+use crate::models::DownloadManager;
+use crate::scheduler::PriorityScheduler;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<InferenceConfig>,
+    pub backend: Arc<dyn InferenceBackend>,
+    pub scheduler: Arc<PriorityScheduler>,
+    pub hardware: Arc<HardwareReport>,
+    pub kv_cache: Arc<TieredKvCache>,
+    pub downloads: Arc<DownloadManager>,
+}
+
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        // OpenAI-compatible API
+        .route("/v1/chat/completions", post(protocol::openai::chat_completions))
+        .route("/v1/models", get(protocol::openai::list_models))
+        .route("/v1/models/{id}", get(protocol::openai::get_model))
+        // Anthropic Messages API
+        .route("/v1/messages", post(protocol::anthropic::messages))
+        .route("/v1/messages/count_tokens", post(protocol::anthropic::count_tokens))
+        // cmod Control, Telemetry & Model Recommender/Downloader Plane
+        .route("/healthz", get(control::healthz))
+        .route("/readyz", get(control::readyz))
+        .route("/cmod/v1/hardware", get(control::hardware))
+        .route("/cmod/v1/status", get(control::status))
+        .route("/cmod/v1/presets", get(control::presets))
+        .route("/cmod/v1/models/recommend", get(control::recommend_models))
+        .route("/cmod/v1/models/local", get(control::local_models))
+        .route("/cmod/v1/models/pull", post(control::start_model_pull))
+        .route("/cmod/v1/models/pull/{id}", get(control::model_pull_status))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}

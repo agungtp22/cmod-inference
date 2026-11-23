@@ -1,0 +1,48 @@
+# Pattern 2b: Enterprise Multi-Node NVIDIA Cluster (vLLM + Ray) behind cmod-inference
+# Head node runs Ray head + vLLM (pipeline-parallel across machines) + cmod-inference dual OpenAI/Anthropic gateway.
+# On each additional worker server, run:
+#   docker run --gpus all --network host vllm/vllm-openai:latest ray start --address=<HEAD_IP>:6379 --block
+
+services:
+  vllm-ray-head:
+    image: vllm/vllm-openai:latest
+    network_mode: host
+    ipc: host
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_HOST_IP=${HEAD_IP:-127.0.0.1}
+    command: >
+      bash -lc "
+        ray start --head --port=6379 --dashboard-host=0.0.0.0 &&
+        vllm serve ${CMOD_MODEL:-Qwen/Qwen3-32B}
+          --host 127.0.0.1
+          --port 8000
+          --tensor-parallel-size ${TP_SIZE:-2}
+          --pipeline-parallel-size ${PP_SIZE:-2}
+          --max-model-len ${CMOD_MAX_MODEL_LEN:-32768}
+          --enable-prefix-caching
+          --distributed-executor-backend ray
+      "
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  cmod-inference:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    network_mode: host
+    depends_on:
+      - vllm-ray-head
+    environment:
+      - CMOD_INFERENCE_BIND=0.0.0.0
+      - CMOD_INFERENCE_PORT=8790
+      - CMOD_INFERENCE_API_KEYS=${CMOD_INFERENCE_API_KEYS:-change-me-in-production}
+      - CMOD_INFERENCE_BACKEND=passthrough
+      - CMOD_INFERENCE_UPSTREAM_URL=http://127.0.0.1:8000/v1
+      - CMOD_INFERENCE_MODEL=${CMOD_MODEL:-Qwen/Qwen3-32B}
+      - CMOD_INFERENCE_MAX_MODEL_LEN=${CMOD_MAX_MODEL_LEN:-32768}

@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+*.gguf
+*.safetensors
+*.onnx
+*.kvcache
+/kvcache
+/models
+.env
+.DS_Store
