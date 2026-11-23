@@ -6,6 +6,8 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
+const FUNC_OPEN: &str = "<function=";
+const FUNC_CLOSE: &str = "</function>";
 
 /// Format tool definitions into a deterministic system prompt block for native GGUF models
 /// (compatible with Qwen / Hermes / Llama / Gemma instruction-tuned models).
@@ -65,6 +67,7 @@ enum ParseState {
     Normal,
     InThink,
     InToolCall,
+    InFuncCall,
 }
 
 /// Incremental streaming parser that separates `<think>...</think>` into `ThinkingDelta`,
@@ -99,9 +102,20 @@ impl NativeOutputParser {
                 ParseState::Normal => {
                     let next_think = self.buf.find(THINK_OPEN);
                     let next_tool = self.buf.find(TOOL_OPEN);
+                    let next_func = self.buf.find(FUNC_OPEN);
 
-                    match (next_think, next_tool) {
-                        (Some(ti), Some(ci)) if ti <= ci => {
+                    // Pick earliest opening tag among <think>, <tool_call>, and <function=
+                    let earliest = [
+                        next_think.map(|i| (i, 0u8)),
+                        next_tool.map(|i| (i, 1u8)),
+                        next_func.map(|i| (i, 2u8)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|(i, _)| *i);
+
+                    match earliest {
+                        Some((ti, 0)) => {
                             let before = self.buf[..ti].to_string();
                             self.buf.drain(..ti + THINK_OPEN.len());
                             if !before.is_empty() {
@@ -109,7 +123,7 @@ impl NativeOutputParser {
                             }
                             self.state = ParseState::InThink;
                         }
-                        (_, Some(ci)) => {
+                        Some((ci, 1)) => {
                             let before = self.buf[..ci].to_string();
                             self.buf.drain(..ci + TOOL_OPEN.len());
                             if !before.is_empty() {
@@ -118,16 +132,18 @@ impl NativeOutputParser {
                             self.tool_buf.clear();
                             self.state = ParseState::InToolCall;
                         }
-                        (Some(ti), None) => {
-                            let before = self.buf[..ti].to_string();
-                            self.buf.drain(..ti + THINK_OPEN.len());
+                        Some((fi, 2)) => {
+                            let before = self.buf[..fi].to_string();
+                            self.buf.drain(..fi + FUNC_OPEN.len());
                             if !before.is_empty() {
                                 events.push(CanonicalStreamEvent::TextDelta(before));
                             }
-                            self.state = ParseState::InThink;
+                            self.tool_buf.clear();
+                            self.state = ParseState::InFuncCall;
                         }
-                        (None, None) => {
-                            let keep = longest_tag_prefix(&self.buf, &[THINK_OPEN, TOOL_OPEN]);
+                        _ => {
+                            let keep =
+                                longest_tag_prefix(&self.buf, &[THINK_OPEN, TOOL_OPEN, FUNC_OPEN]);
                             let emit_len = self.buf.len().saturating_sub(keep);
                             if emit_len > 0 {
                                 let out = self.buf[..emit_len].to_string();
@@ -173,6 +189,22 @@ impl NativeOutputParser {
                         break;
                     }
                 }
+                ParseState::InFuncCall => {
+                    if let Some(end) = self.buf.find(FUNC_CLOSE) {
+                        self.tool_buf.push_str(&self.buf[..end]);
+                        self.buf.drain(..end + FUNC_CLOSE.len());
+                        self.emit_func_call(&mut events);
+                        self.state = ParseState::Normal;
+                    } else {
+                        let keep = longest_tag_prefix(&self.buf, &[FUNC_CLOSE]);
+                        let take_len = self.buf.len().saturating_sub(keep);
+                        if take_len > 0 {
+                            self.tool_buf.push_str(&self.buf[..take_len]);
+                            self.buf.drain(..take_len);
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -198,6 +230,11 @@ impl NativeOutputParser {
                 self.tool_buf.push_str(&self.buf);
                 self.buf.clear();
                 self.emit_tool_call(&mut events);
+            }
+            ParseState::InFuncCall => {
+                self.tool_buf.push_str(&self.buf);
+                self.buf.clear();
+                self.emit_func_call(&mut events);
             }
         }
         events
@@ -234,6 +271,38 @@ impl NativeOutputParser {
         }
         // Fallback: if invalid JSON inside <tool_call>, return raw text rather than dropping it
         events.push(CanonicalStreamEvent::TextDelta(raw));
+    }
+
+    /// Parse `<function=tool_name>{...json args...}</function>` format used by MiMo-V2.6 / Qwen3.5.
+    fn emit_func_call(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
+        let raw = self.tool_buf.trim().to_string();
+        self.tool_buf.clear();
+        if let Some((name_part, args_part)) = raw.split_once('>') {
+            let name = name_part.trim();
+            let args_raw = args_part.trim();
+            if !name.is_empty() {
+                if let Ok(args_val) = serde_json::from_str::<Value>(args_raw) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args_str =
+                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    return;
+                }
+            }
+        }
+        if !raw.is_empty() {
+            events.push(CanonicalStreamEvent::TextDelta(format!("<function={raw}")));
+        }
     }
 }
 
