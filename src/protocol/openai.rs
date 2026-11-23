@@ -695,3 +695,88 @@ pub async fn chat_completions(
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct OpenAiEmbeddingsRequest {
+    #[serde(default)]
+    pub model: String,
+    pub input: Value,
+}
+
+pub async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<OpenAiEmbeddingsRequest>,
+) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid_api_key",
+            "API key tidak valid atau tidak diberikan",
+        );
+    }
+
+    let inputs: Vec<String> = match body.input {
+        Value::String(s) => vec![s],
+        Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if inputs.is_empty() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_input",
+            "Field 'input' wajib berupa string atau array of string yang tidak kosong",
+        );
+    }
+
+    let priority = extract_priority(&headers);
+    let _permit = match state.scheduler.acquire(priority).await {
+        Ok(p) => p,
+        Err(msg) => {
+            return openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "queue_full",
+                msg,
+            );
+        }
+    };
+
+    match state.backend.embeddings(body.model, inputs).await {
+        Ok(resp) => {
+            let data: Vec<Value> = resp
+                .embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| {
+                    json!({
+                        "object": "embedding",
+                        "index": index,
+                        "embedding": embedding,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "object": "list",
+                "data": data,
+                "model": resp.model,
+                "usage": {
+                    "prompt_tokens": resp.prompt_tokens,
+                    "total_tokens": resp.prompt_tokens,
+                }
+            }))
+            .into_response()
+        }
+        Err(err) => openai_error(
+            StatusCode::BAD_GATEWAY,
+            "backend_error",
+            "embeddings_error",
+            err.to_string(),
+        ),
+    }
+}

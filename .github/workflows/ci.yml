@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-gateway:
+    name: Test Gateway & Conformance (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit & conformance tests
+        run: cargo test --locked || cargo test
+      - name: Check release build (gateway)
+        run: cargo build --release
+
+  build-macos-metal:
+    name: Build & Test Native Metal (macOS ARM64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with Metal & Multimodal features
+        run: cargo test --features "metal multimodal"
+      - name: Build release binary (Metal + Multimodal)
+        run: cargo build --release --features "metal multimodal"

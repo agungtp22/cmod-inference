@@ -2,7 +2,23 @@
 
 **Standalone, multi-GPU & multi-machine local AI inference server written in Rust.**
 
-`cmod-inference` combines a **dual-protocol API gateway** (native OpenAI + Anthropic), an **in-process Level-2 GGUF engine** (`llama-cpp-2`), **`llguidance` constrained decoding**, a **3-Tier KV-Cache (L1 VRAM → L2 Host RAM → L3 NVMe Disk)**, **Dual-Lane Priority Scheduling**, and **Multi-Machine Cluster Routing** into a single cross-platform binary.
+`cmod-inference` combines a **dual-protocol API gateway** (native OpenAI + Anthropic), an **in-process Level-2 GGUF engine** (`llama-cpp-2`), **`llguidance` constrained decoding**, a **3-Tier KV-Cache (L1 VRAM → L2 Host RAM → L3 NVMe Disk)**, **Dual-Lane Priority Scheduling**, **Prometheus `/metrics`**, **Embeddings (`/v1/embeddings`)**, and **Multi-Machine Cluster Routing** into a single cross-platform binary.
+
+```mermaid
+flowchart LR
+    C1["OpenAI SDK / Clients<br/>/v1/chat/completions<br/>/v1/embeddings"] --> GW
+    C2["Anthropic SDK / Agents<br/>/v1/messages<br/>/v1/messages/count_tokens"] --> GW
+    C3["Prometheus / Grafana<br/>/metrics & /cmod/v1/status"] --> GW
+
+    subgraph GW["cmod-inference (Rust / Axum)"]
+        AUTH["Auth + SSRF Guard +<br/>Context Window Guard"] --> SCHED["Dual-Lane Priority Scheduler<br/>(Interactive vs Batch + Prefix Affinity)"]
+        SCHED --> RT{"Backend Mode"}
+        RT -- "native" --> NAT["In-Process llama-cpp-2<br/>VRAM Context Pool + llguidance + mtmd"]
+        RT -- "cluster" --> CLU["Pattern 1: Prefix-Aware<br/>Cluster Router + Failover"]
+        RT -- "mlx / llamacpp / passthrough" --> SUP["Managed mlx_lm / llama-server (ggml-rpc)<br/>or vLLM + Ray / Ollama"]
+        NAT <--> KV["3-Tier KV-Cache<br/>L1 VRAM → L2 RAM → L3 NVMe Disk"]
+    end
+```
 
 ---
 
@@ -284,10 +300,12 @@ cmod serve --backend mlx --model mlx-community/Qwen3-4B-Instruct-2507-4bit
 | Plane | Endpoint | Description |
 |---|---|---|
 | **OpenAI** | `POST /v1/chat/completions` | Chat completions (streaming, JSON schema, tools, base64 images) |
+| **OpenAI** | `POST /v1/embeddings` | L2-normalized text embeddings (in-process GGUF or upstream/cluster) |
 | **OpenAI** | `GET /v1/models`, `GET /v1/models/{id}` | List / inspect active model and presets |
 | **Anthropic** | `POST /v1/messages` | Messages API (full SSE, thinking blocks, tool_use, prompt caching) |
 | **Anthropic** | `POST /v1/messages/count_tokens` | Token count estimator |
 | **Control** | `GET /healthz`, `GET /readyz` | Liveness and backend readiness probes |
+| **Monitoring** | `GET /metrics` | Prometheus text exposition metrics for Grafana & alerting |
 | **Telemetry** | `GET /cmod/v1/status` | Live backend, scheduler, 3-Tier KV-Cache, and hardware telemetry |
 | **Telemetry** | `GET /cmod/v1/hardware`, `GET /cmod/v1/presets` | GPU/RAM hardware report & built-in presets |
 | **Models** | `GET /cmod/v1/models/recommend` | 30 curated models scored for current hardware with capability tags |

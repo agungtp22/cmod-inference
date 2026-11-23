@@ -7,7 +7,7 @@ mod imp {
     use std::sync::Arc;
 
     use anyhow::{anyhow, Context, Result};
-    use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+    use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
     use llama_cpp_2::context::session::LlamaStateSeqFlags;
     use llama_cpp_2::context::LlamaContext;
     use llama_cpp_2::llama_backend::LlamaBackend;
@@ -20,7 +20,7 @@ mod imp {
     use tracing::{info, warn};
 
     use crate::backend::parser::{format_tools_system_block, NativeOutputParser};
-    use crate::backend::{BackendHealth, EventStream, InferenceBackend};
+    use crate::backend::{BackendHealth, EmbeddingResponse, EventStream, InferenceBackend};
     use crate::cache::{compute_model_fingerprint, NativeKvSnapshot, TieredKvCache};
     use crate::config::BackendConfig;
     use crate::ir::{
@@ -992,6 +992,88 @@ mod imp {
                         mm
                     )),
                 }
+            })
+        }
+
+        fn embeddings(
+            &self,
+            model: String,
+            inputs: Vec<String>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<EmbeddingResponse>> + Send + '_>> {
+            let inner = self.inner.clone();
+            let resp_model = if model.trim().is_empty() {
+                inner.model_id.clone()
+            } else {
+                model
+            };
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    let max_ctx = inner.max_model_len.min(4096);
+                    let ctx_params = LlamaContextParams::default()
+                        .with_n_ctx(NonZeroU32::new(max_ctx))
+                        .with_n_batch(512)
+                        .with_n_threads(inner.n_threads)
+                        .with_n_threads_batch(inner.n_threads)
+                        .with_embeddings(true)
+                        .with_pooling_type(LlamaPoolingType::Mean);
+
+                    let mut ctx = inner
+                        .model
+                        .new_context(&inner.backend, ctx_params)
+                        .context("gagal membuat LlamaContext embeddings")?;
+                    let vocab = inner.model.vocab();
+                    let mut batch = LlamaBatch::new(512, 1);
+                    let mut embeddings = Vec::with_capacity(inputs.len());
+                    let mut total_tokens: u64 = 0;
+
+                    for text in &inputs {
+                        ctx.clear_kv_cache();
+                        let mut tokens = vocab.tokenize(text.as_bytes(), true, true);
+                        if tokens.is_empty() {
+                            tokens = vocab.tokenize(b" ", true, true);
+                        }
+                        if tokens.len() > max_ctx as usize {
+                            tokens.truncate(max_ctx as usize);
+                        }
+                        total_tokens += tokens.len() as u64;
+
+                        for chunk_start in (0..tokens.len()).step_by(512) {
+                            batch.clear();
+                            let chunk_end = (chunk_start + 512).min(tokens.len());
+                            for (offset, &tok) in tokens[chunk_start..chunk_end].iter().enumerate() {
+                                let pos = (chunk_start + offset) as i32;
+                                let is_last = pos as usize == tokens.len() - 1;
+                                batch.add(tok, pos, &[0], is_last)?;
+                            }
+                            ctx.decode(&mut batch)
+                                .context("gagal menghitung embeddings")?;
+                        }
+
+                        let raw_vec: Vec<f32> = match ctx.embeddings_seq_ith(0) {
+                            Ok(slice) => slice.to_vec(),
+                            Err(_) => ctx
+                                .embeddings_ith(batch.n_tokens() - 1)
+                                .map(|s| s.to_vec())
+                                .map_err(|e| anyhow!("gagal mengambil vektor embeddings: {e:?}"))?,
+                        };
+                        // L2 normalize for cosine similarity compatibility
+                        let norm = raw_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        let normalized = if norm > 1e-12 {
+                            raw_vec.into_iter().map(|x| x / norm).collect()
+                        } else {
+                            raw_vec
+                        };
+                        embeddings.push(normalized);
+                    }
+
+                    Ok(EmbeddingResponse {
+                        model: resp_model,
+                        embeddings,
+                        prompt_tokens: total_tokens,
+                    })
+                })
+                .await
+                .context("task embeddings panic")?
             })
         }
     }

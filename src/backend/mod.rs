@@ -16,6 +16,14 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<CanonicalStreamEvent>> +
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EmbeddingResponse {
+    pub model: String,
+    pub embeddings: Vec<Vec<f32>>,
+    pub prompt_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BackendHealth {
     pub ready: bool,
     pub kind: String,
@@ -42,4 +50,16 @@ pub trait InferenceBackend: Send + Sync {
     fn health(
         &self,
     ) -> Pin<Box<dyn std::future::Future<Output = BackendHealth> + Send + '_>>;
+
+    fn embeddings(
+        &self,
+        _model: String,
+        _inputs: Vec<String>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<EmbeddingResponse>> + Send + '_>> {
+        Box::pin(async {
+            Err(anyhow::anyhow!(
+                "Backend ini belum mendukung endpoint /v1/embeddings"
+            ))
+        })
+    }
 }

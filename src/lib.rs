@@ -38,14 +38,16 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // OpenAI-compatible API
         .route("/v1/chat/completions", post(protocol::openai::chat_completions))
+        .route("/v1/embeddings", post(protocol::openai::embeddings))
         .route("/v1/models", get(protocol::openai::list_models))
         .route("/v1/models/{id}", get(protocol::openai::get_model))
         // Anthropic Messages API
         .route("/v1/messages", post(protocol::anthropic::messages))
         .route("/v1/messages/count_tokens", post(protocol::anthropic::count_tokens))
-        // cmod Control, Telemetry & Model Recommender/Downloader Plane
+        // cmod Control, Telemetry, Prometheus & Model Recommender/Downloader Plane
         .route("/healthz", get(control::healthz))
         .route("/readyz", get(control::readyz))
+        .route("/metrics", get(control::metrics))
         .route("/cmod/v1/hardware", get(control::hardware))
         .route("/cmod/v1/status", get(control::status))
         .route("/cmod/v1/presets", get(control::presets))

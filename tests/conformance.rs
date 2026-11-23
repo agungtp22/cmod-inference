@@ -488,4 +488,12 @@ async fn ssrf_guard_and_context_window_guard_and_control_plane() {
     let arr = recs["recommendations"].as_array().unwrap();
     assert!(!arr.is_empty());
     assert_eq!(arr[0]["status"], json!("recommended"));
+
+    // Prometheus /metrics endpoint
+    let prom_resp = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(prom_resp.status(), 200);
+    let prom_text = prom_resp.text().await.unwrap();
+    assert!(prom_text.contains("cmod_inference_ready"));
+    assert!(prom_text.contains("cmod_inference_kv_cache_hits_total{tier=\"l1_vram\"}"));
+    assert!(prom_text.contains("cmod_inference_hardware_usable_vram_mb"));
 }

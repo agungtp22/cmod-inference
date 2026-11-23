@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
 
 use crate::backend::openai_upstream::OpenAiUpstreamBackend;
-use crate::backend::{BackendHealth, EventStream, InferenceBackend};
+use crate::backend::{BackendHealth, EmbeddingResponse, EventStream, InferenceBackend};
 use crate::config::{BackendConfig, ClusterNodeConfig};
 use crate::ir::{CanonicalRequest, CanonicalResponse};
 
@@ -258,6 +258,33 @@ impl InferenceBackend for ClusterBackend {
                     summaries.join(", ")
                 )),
             }
+        })
+    }
+
+    fn embeddings(
+        &self,
+        model: String,
+        inputs: Vec<String>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<EmbeddingResponse>> + Send + '_>> {
+        Box::pin(async move {
+            let mut last_err = anyhow!("tidak ada node cluster yang tersedia");
+            for node in &self.nodes {
+                if !node.matches_model(&model) {
+                    continue;
+                }
+                match node.backend.embeddings(model.clone(), inputs.clone()).await {
+                    Ok(resp) => {
+                        node.healthy.store(true, Ordering::Relaxed);
+                        node.requests.fetch_add(1, Ordering::Relaxed);
+                        return Ok(resp);
+                    }
+                    Err(err) => {
+                        node.healthy.store(false, Ordering::Relaxed);
+                        last_err = err;
+                    }
+                }
+            }
+            Err(anyhow!("Semua node cluster gagal embeddings: {last_err}"))
         })
     }
 }

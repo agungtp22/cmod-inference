@@ -6,7 +6,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::backend::{BackendHealth, EventStream, InferenceBackend};
+use crate::backend::{BackendHealth, EmbeddingResponse, EventStream, InferenceBackend};
 use crate::config::{BackendConfig, BackendKind};
 use crate::ir::{
     CanonicalRequest, CanonicalResponse, CanonicalStreamEvent, CanonicalToolCall, ContentPart,
@@ -606,6 +606,81 @@ impl InferenceBackend for OpenAiUpstreamBackend {
                     detail: Some(err.to_string()),
                 },
             }
+        })
+    }
+
+    fn embeddings(
+        &self,
+        model: String,
+        inputs: Vec<String>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<EmbeddingResponse>> + Send + '_>> {
+        Box::pin(async move {
+            let url = format!("{}/embeddings", self.upstream_url);
+            let target_model = if model.trim().is_empty() {
+                self.default_model.clone()
+            } else {
+                model
+            };
+            let payload = json!({
+                "model": target_model,
+                "input": inputs,
+            });
+            let resp = self
+                .apply_auth(self.client.post(&url))
+                .json(&payload)
+                .send()
+                .await
+                .with_context(|| format!("gagal menghubungi upstream embeddings {url}"))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(anyhow!("Upstream embeddings HTTP {status}: {text}"));
+            }
+            let raw: Value =
+                serde_json::from_str(&text).context("response embeddings upstream bukan JSON")?;
+            let mut items: Vec<(usize, Vec<f32>)> = raw
+                .get("data")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let idx = item
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as usize)
+                                .unwrap_or(i);
+                            let vec = item
+                                .get("embedding")
+                                .and_then(Value::as_array)
+                                .map(|nums| {
+                                    nums.iter()
+                                        .filter_map(|n| n.as_f64().map(|f| f as f32))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (idx, vec)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            items.sort_by_key(|(idx, _)| *idx);
+            let embeddings = items.into_iter().map(|(_, v)| v).collect();
+            let prompt_tokens = raw
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let resp_model = raw
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&target_model)
+                .to_string();
+            Ok(EmbeddingResponse {
+                model: resp_model,
+                embeddings,
+                prompt_tokens,
+            })
         })
     }
 }
