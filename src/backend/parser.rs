@@ -29,26 +29,34 @@ pub fn format_tools_system_block(
         }));
     }
 
+    let defs_lines = defs
+        .iter()
+        .filter_map(|d| serde_json::to_string(d).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let policy = match choice {
         Some(ToolChoice::Required) => {
-            "Anda WAJIB memanggil minimal satu tool dari daftar di atas."
+            "You MUST call at least one function from the tools list above."
         }
         Some(ToolChoice::Named { name }) => {
             return Some(format!(
-                "Anda memiliki akses ke tool berikut:\n<tools>\n{}\n</tools>\n\n\
-                 Anda WAJIB memanggil tool `{name}` menggunakan format persis:\n\
-                 <tool_call>\n{{\"name\": \"{name}\", \"arguments\": {{...}}}}\n</tool_call>",
-                serde_json::to_string(&defs).unwrap_or_default()
+                "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+                 You are provided with function signatures within <tools></tools> XML tags:\n\
+                 <tools>\n{defs_lines}\n</tools>\n\n\
+                 You MUST call the function `{name}` using <tool_call></tool_call> XML tags:\n\
+                 <tool_call>\n{{\"name\": \"{name}\", \"arguments\": <args-json-object>}}\n</tool_call>"
             ));
         }
-        _ => "Jika perlu memanggil tool, keluarkan blok tool_call persis sesuai format.",
+        _ => "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:",
     };
 
     Some(format!(
-        "Anda memiliki akses ke tool berikut:\n<tools>\n{}\n</tools>\n\n\
-         {policy}\nFormat pemanggilan tool:\n\
-         <tool_call>\n{{\"name\": \"nama_tool\", \"arguments\": {{...}}}}\n</tool_call>",
-        serde_json::to_string(&defs).unwrap_or_default()
+        "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n\
+         <tools>\n{defs_lines}\n</tools>\n\n\
+         {policy}\n\
+         <tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>"
     ))
 }
 

@@ -734,7 +734,9 @@ mod imp {
                 l1_tokens.push(token);
             }
 
-            let piece = vocab.token_to_piece(token, false, None);
+            // Pass `special = true` so model-native special tags like `<tool_call>`, `</tool_call>`,
+            // `<think>`, and `</think>` are rendered for `NativeOutputParser` (EOG tokens already broke above).
+            let piece = vocab.token_to_piece(token, true, None);
             utf8_buf.extend_from_slice(&piece);
             output_count += 1;
 
