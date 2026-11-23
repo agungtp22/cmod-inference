@@ -246,6 +246,13 @@ impl NativeOutputParser {
         if raw.is_empty() {
             return;
         }
+        // Handle nested `<tool_call><function=NAME>{...}</function></tool_call>` (MiMo-V2.6 / Qwen3.5)
+        if let Some(rest) = raw.strip_prefix(FUNC_OPEN) {
+            let inner = rest.strip_suffix(FUNC_CLOSE).unwrap_or(rest).trim();
+            self.tool_buf = inner.to_string();
+            self.emit_func_call(events);
+            return;
+        }
         if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
             if let Some(name) = parsed.get("name").and_then(Value::as_str) {
                 let idx = self.tool_count;
