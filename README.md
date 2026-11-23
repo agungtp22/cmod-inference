@@ -45,6 +45,60 @@
 
 ---
 
+## Supported Libraries, Model Formats & Hardware
+
+### Drop-In Client SDKs & Ecosystem Support
+
+Because `cmod-inference` natively implements both the **OpenAI** and **Anthropic** wire protocols, it works out-of-the-box with major SDKs and agent frameworks:
+
+- **OpenAI Ecosystem:** `openai` (Python / TypeScript / Go), Vercel AI SDK, LangChain, LlamaIndex, LiteLLM, Open WebUI, Continue.dev — set `base_url="http://127.0.0.1:8790/v1"`.
+- **Anthropic Ecosystem:** `anthropic` (Python), `@anthropic-ai/sdk` (TypeScript), and Anthropic-compatible agent runners — set `base_url="http://127.0.0.1:8790"`.
+
+**Python (OpenAI SDK):**
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8790/v1", api_key="local-key")
+resp = client.chat.completions.create(
+    model="qwen3-4b-doc",
+    messages=[{"role": "user", "content": "Hello from OpenAI SDK!"}],
+    extra_body={"enable_thinking": False, "verbose": True},
+)
+print(resp.choices[0].message.content)
+```
+
+**Python (Anthropic SDK):**
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8790", api_key="local-key")
+msg = client.messages.create(
+    model="qwen3-4b-doc",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Hello from Anthropic SDK!"}],
+)
+print(msg.content[0].text)
+```
+
+### Supported Formats, Model Families & Hardware Matrix
+
+| Category | Supported Options | Backend Mode |
+|---|---|---|
+| **Model Formats** | **GGUF** (Q4_K_M, Q8_0, UD-Q4_K_XL, etc. + `mmproj` VLM) | `native` (in-process), `llamacpp` |
+| | **Apple MLX** (4-bit / 8-bit MLX models on Apple Silicon) | `mlx` (managed `mlx_lm.server`) |
+| | **Safetensors / FP8 / AWQ / GPTQ** | `vllm`, `passthrough` (vLLM, SGLang, mistral.rs, Ollama) |
+| **Model Families** | **Qwen3 / Qwen3.5 / Qwen3-VL / Qwen3-Coder**, **Gemma 4 / Gemma 3**, **DeepSeek-R1**, **gpt-oss MoE**, **Mistral Small 3.2 / Devstral**, **Phi-4**, **GLM-4**, **SmolLM3**, **Llama 3/4** | All GGUF architectures supported by `llama.cpp` |
+| **Hardware & OS** | **macOS Apple Silicon** (Metal & MLX), **NVIDIA** (CUDA), **AMD** (ROCm), **Intel/Cross-Vendor** (Vulkan), **CPU** (AVX2/AVX-512/NEON) | Build feature: `metal`, `cuda`, `rocm`, `vulkan`, or `native` |
+
+### Core Rust Stack
+
+- **Inference & Multimodal:** [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) (`ggml` + `mtmd` vision projector)
+- **Constrained Decoding:** [`llguidance`](https://crates.io/crates/llguidance) & [`toktrie`](https://crates.io/crates/toktrie) (in-process JSON Schema & tool-call grammar)
+- **HTTP & Async Runtime:** [`axum`](https://crates.io/crates/axum), [`tokio`](https://crates.io/crates/tokio), [`tower-http`](https://crates.io/crates/tower-http), [`reqwest`](https://crates.io/crates/reqwest)
+- **CLI & System Telemetry:** [`clap`](https://crates.io/crates/clap), [`sysinfo`](https://crates.io/crates/sysinfo)
+
+---
+
 ## Benchmarks (Apple M4 Pro, 24 GB Unified Memory)
 
 Measured head-to-head against **Ollama `v0.40.16`** using the **exact same GGUF model files**, `ctx=8192`, `temperature=0.0`, and `--release` build:
