@@ -99,6 +99,10 @@ TIPS:
         #[arg(long)]
         model_path: Option<PathBuf>,
 
+        /// Direktori penyimpanan model lokal .gguf untuk Web UI & /cmod/v1/models/* (default: folder --model-path atau ./models)
+        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+
         /// Path file projector multimodal mmproj-*.gguf untuk model VLM/gambar
         #[arg(long)]
         mmproj: Option<PathBuf>,
@@ -328,6 +332,7 @@ async fn main() -> Result<()> {
             backend,
             model,
             model_path,
+            models_dir,
             mmproj,
             lora,
             no_think,
@@ -401,10 +406,18 @@ async fn main() -> Result<()> {
                 cfg.backend.model = m;
             }
             if let Some(mp) = model_path {
+                if models_dir.is_none() && cfg.backend.models_dir == "./models" {
+                    if let Some(parent) = mp.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        cfg.backend.models_dir = parent.display().to_string();
+                    }
+                }
                 cfg.backend.model_path = mp.display().to_string();
                 if matches!(cfg.backend.kind, BackendKind::Llamacpp) {
                     cfg.backend.manage_local_process = true;
                 }
+            }
+            if let Some(md) = models_dir {
+                cfg.backend.models_dir = md.display().to_string();
             }
             if let Some(mm) = mmproj {
                 cfg.backend.mmproj_path = mm.display().to_string();
