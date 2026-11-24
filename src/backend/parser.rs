@@ -280,7 +280,9 @@ impl NativeOutputParser {
         events.push(CanonicalStreamEvent::TextDelta(raw));
     }
 
-    /// Parse `<function=tool_name>{...json args...}</function>` format used by MiMo-V2.6 / Qwen3.5.
+    /// Parse `<function=tool_name>{...json args...}</function>` OR
+    /// `<function=tool_name><parameter=key>val</parameter>...</function>`
+    /// formats used by MiMo-V2.6, Qwen3.5, and Qwen3-Coder.
     fn emit_func_call(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
         let raw = self.tool_buf.trim().to_string();
         self.tool_buf.clear();
@@ -288,7 +290,10 @@ impl NativeOutputParser {
             let name = name_part.trim();
             let args_raw = args_part.trim();
             if !name.is_empty() {
-                if let Ok(args_val) = serde_json::from_str::<Value>(args_raw) {
+                let args_val = serde_json::from_str::<Value>(args_raw)
+                    .ok()
+                    .or_else(|| parse_xml_parameters(args_raw));
+                if let Some(args_val) = args_val {
                     let idx = self.tool_count;
                     self.tool_count += 1;
                     let id = format!("call_native_{}", idx + 1);
@@ -310,6 +315,39 @@ impl NativeOutputParser {
         if !raw.is_empty() {
             events.push(CanonicalStreamEvent::TextDelta(format!("<function={raw}")));
         }
+    }
+}
+
+fn parse_xml_parameters(raw: &str) -> Option<Value> {
+    const P_OPEN: &str = "<parameter=";
+    const P_CLOSE: &str = "</parameter>";
+    let mut map = serde_json::Map::new();
+    let mut rest = raw;
+
+    while let Some(start) = rest.find(P_OPEN) {
+        let after_open = &rest[start + P_OPEN.len()..];
+        let (key_part, after_gt) = after_open.split_once('>')?;
+        let key = key_part.trim();
+        let (val_part, remaining) = match after_gt.find(P_CLOSE) {
+            Some(end) => (&after_gt[..end], &after_gt[end + P_CLOSE.len()..]),
+            None => (after_gt, ""),
+        };
+        let trimmed = val_part.trim();
+        // Preserve strings unless the value is a JSON boolean/number/array/object
+        let parsed = match serde_json::from_str::<Value>(trimmed) {
+            Ok(v @ (Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_))) => v,
+            _ => Value::String(trimmed.to_string()),
+        };
+        if !key.is_empty() {
+            map.insert(key.to_string(), parsed);
+        }
+        rest = remaining;
+    }
+
+    if map.is_empty() && !raw.trim().is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
     }
 }
 
@@ -372,5 +410,25 @@ mod tests {
         assert_eq!(tool_name, "lookup_benefit");
         assert_eq!(tool_args, "{\"code\":\"06\"}");
         assert!(parser.had_tool_calls());
+    }
+
+    #[test]
+    fn parses_mimo_qwen35_xml_parameter_tool_calls() {
+        let mut parser = NativeOutputParser::new();
+        let input = "<tool_call><function=list_directory><parameter=path>/Users/test/agentcode</parameter></function></tool_call>";
+        let mut events = parser.push(input);
+        events.extend(parser.finish());
+        assert!(parser.had_tool_calls());
+        let mut name = String::new();
+        let mut args = String::new();
+        for ev in events {
+            match ev {
+                CanonicalStreamEvent::ToolCallStart { name: n, .. } => name = n,
+                CanonicalStreamEvent::ToolCallDelta { arguments_delta, .. } => args.push_str(&arguments_delta),
+                _ => {}
+            }
+        }
+        assert_eq!(name, "list_directory");
+        assert_eq!(args, "{\"path\":\"/Users/test/agentcode\"}");
     }
 }
