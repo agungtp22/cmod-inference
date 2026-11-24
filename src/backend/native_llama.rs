@@ -928,12 +928,90 @@ mod imp {
         } else {
             None
         };
-        let prompt = format_prompt(&inner.model, &req)?;
+        let mut req = req;
+        let mut prompt = format_prompt(&inner.model, &req)?;
         let vocab = inner.model.vocab();
-        let add_bos = !prompt.starts_with("<s>");
-        let prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
-        let input_count = prompt_tokens.len() as u64;
+        let mut add_bos = !prompt.starts_with("<s>");
+        let mut prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
         let max_ctx_usize = inner.max_model_len as usize;
+        let safe_prompt_limit = max_ctx_usize.saturating_sub(512).max(256);
+
+        // Exact-tokenizer auto-compacting: if actual token count exceeds the safe budget
+        // (even after the fast chars/4 pre-check), prune old tool results and slide-compact
+        // oldest turns while keeping system prompt + the most recent 4 turns intact.
+        if prompt_tokens.len() > safe_prompt_limit && req.messages.len() > 4 {
+            let before_toks = prompt_tokens.len();
+            // Stage 1: aggressively prune old ToolResult payloads outside the last 4 messages
+            let cutoff = req.messages.len().saturating_sub(4);
+            let mut pruned_tools = 0usize;
+            for idx in 0..cutoff {
+                for part in &mut req.messages[idx].parts {
+                    if let ContentPart::ToolResult { content, .. } = part {
+                        if content.len() > 160 {
+                            let orig = content.chars().count();
+                            let head: String = content.chars().take(100).collect();
+                            *content = format!("{head}\n...[auto-compacted tool_result: {orig} chars]");
+                            pruned_tools += 1;
+                        }
+                    }
+                }
+            }
+            if pruned_tools > 0 {
+                prompt = format_prompt(&inner.model, &req)?;
+                add_bos = !prompt.starts_with("<s>");
+                prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
+            }
+
+            // Stage 2: sliding-window drop of oldest turns if still above safe_prompt_limit
+            let mut dropped_turns = 0usize;
+            while prompt_tokens.len() > safe_prompt_limit && req.messages.len() > 4 {
+                req.messages.remove(0);
+                dropped_turns += 1;
+                if dropped_turns == 1 || dropped_turns % 2 == 0 || req.messages.len() <= 4 {
+                    let mut tmp_req = req.clone();
+                    tmp_req.messages.insert(
+                        0,
+                        crate::ir::CanonicalMessage {
+                            role: Role::User,
+                            parts: vec![ContentPart::Text {
+                                text: format!(
+                                    "[Auto-compacted {dropped_turns} earlier messages to stay within {max_ctx_usize} token context window. Continue from the recent turns below.]"
+                                ),
+                            }],
+                        },
+                    );
+                    prompt = format_prompt(&inner.model, &tmp_req)?;
+                    add_bos = !prompt.starts_with("<s>");
+                    prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
+                }
+            }
+            if dropped_turns > 0 {
+                req.messages.insert(
+                    0,
+                    crate::ir::CanonicalMessage {
+                        role: Role::User,
+                        parts: vec![ContentPart::Text {
+                            text: format!(
+                                "[Auto-compacted {dropped_turns} earlier messages to stay within {max_ctx_usize} token context window. Continue from the recent turns below.]"
+                            ),
+                        }],
+                    },
+                );
+                prompt = format_prompt(&inner.model, &req)?;
+                add_bos = !prompt.starts_with("<s>");
+                prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
+            }
+            info!(
+                before_toks,
+                after_toks = prompt_tokens.len(),
+                pruned_tools,
+                dropped_turns,
+                max_ctx = max_ctx_usize,
+                "Auto-compacted conversation using actual tokenizer count"
+            );
+        }
+
+        let input_count = prompt_tokens.len() as u64;
         if prompt_tokens.len() + 1 >= max_ctx_usize {
             return Err(anyhow!(
                 "context_length_exceeded: jumlah token aktual ({}) melampaui batas context server ({}). Mulai thread baru atau naikkan --ctx.",
