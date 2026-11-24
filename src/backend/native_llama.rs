@@ -399,8 +399,16 @@ mod imp {
             );
         }
 
-        let mut rendered = if let Ok(tmpl) = model.chat_template(None) {
-            if let Ok(r) = model.apply_chat_template(&tmpl, &chat_msgs, true) {
+        let tmpl_res = model.chat_template(None);
+        let is_mistral_tmpl = tmpl_res
+            .as_ref()
+            .ok()
+            .and_then(|t| t.to_str().ok())
+            .map(|s| s.contains("[SYSTEM_PROMPT]") || s.contains("[INST]"))
+            .unwrap_or(false);
+
+        let mut rendered = if let Ok(ref tmpl) = tmpl_res {
+            if let Ok(r) = model.apply_chat_template(tmpl, &chat_msgs, true) {
                 r
             } else {
                 String::new()
@@ -410,26 +418,90 @@ mod imp {
         };
 
         if rendered.is_empty() {
-            if !sys_parts.is_empty() {
-                rendered.push_str("<|im_start|>system\n");
-                rendered.push_str(&sys_parts.join("\n\n"));
-                rendered.push_str("<|im_end|>\n");
-            }
-            for msg in &req.messages {
-                let role = match msg.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
-                };
-                rendered.push_str(&format!("<|im_start|>{role}\n"));
-                for p in &msg.parts {
-                    if let ContentPart::Text { text } = p {
-                        rendered.push_str(text);
+            if is_mistral_tmpl {
+                // Native Mistral v3 / Ministral-3 Tekken chat format when llama_chat_apply_template
+                // cannot evaluate complex Jinja2 templates.
+                rendered.push_str("<s>");
+                if !sys_parts.is_empty() {
+                    rendered.push_str("[SYSTEM_PROMPT]");
+                    rendered.push_str(&sys_parts.join("\n\n"));
+                    rendered.push_str("[/SYSTEM_PROMPT]");
+                }
+                for msg in &req.messages {
+                    match msg.role {
+                        Role::User => {
+                            rendered.push_str("[INST]");
+                            for p in &msg.parts {
+                                if let ContentPart::Text { text } = p {
+                                    rendered.push_str(text);
+                                }
+                            }
+                            rendered.push_str("[/INST]");
+                        }
+                        Role::Assistant => {
+                            for p in &msg.parts {
+                                match p {
+                                    ContentPart::Text { text } => rendered.push_str(text),
+                                    ContentPart::ToolUse {
+                                        name, arguments, ..
+                                    } => {
+                                        rendered.push_str(&format!(
+                                            "[TOOL_CALLS]{name}[ARGS]{}",
+                                            serde_json::to_string(arguments)
+                                                .unwrap_or_else(|_| "{}".to_string())
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            rendered.push_str("</s>");
+                        }
+                        Role::Tool => {
+                            for p in &msg.parts {
+                                if let ContentPart::ToolResult { content, .. } = p {
+                                    rendered.push_str("[TOOL_RESULTS]");
+                                    rendered.push_str(content);
+                                    rendered.push_str("[/TOOL_RESULTS]");
+                                }
+                            }
+                        }
                     }
                 }
-                rendered.push_str("<|im_end|>\n");
+            } else {
+                if !sys_parts.is_empty() {
+                    rendered.push_str("<|im_start|>system\n");
+                    rendered.push_str(&sys_parts.join("\n\n"));
+                    rendered.push_str("<|im_end|>\n");
+                }
+                for msg in &req.messages {
+                    let role = match msg.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    };
+                    rendered.push_str(&format!("<|im_start|>{role}\n"));
+                    for p in &msg.parts {
+                        match p {
+                            ContentPart::Text { text } => rendered.push_str(text),
+                            ContentPart::ToolResult {
+                                tool_call_id,
+                                content,
+                                ..
+                            } => rendered.push_str(&format!("[tool_result:{tool_call_id}] {content}")),
+                            ContentPart::ToolUse {
+                                name, arguments, ..
+                            } => rendered.push_str(&format!(
+                                "<tool_call>\n{{\"name\":\"{name}\",\"arguments\":{}}}\n</tool_call>",
+                                serde_json::to_string(arguments)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            )),
+                            _ => {}
+                        }
+                    }
+                    rendered.push_str("<|im_end|>\n");
+                }
+                rendered.push_str("<|im_start|>assistant\n");
             }
-            rendered.push_str("<|im_start|>assistant\n");
         }
 
         // Honor explicit non_thinking (enable_thinking=false / thinking.type=disabled)
@@ -542,6 +614,10 @@ mod imp {
         if temp <= 0.001 {
             chain.push(LlamaSampler::greedy());
         } else {
+            // Always filter long-tail garbage tokens (prevents multilingual token drift
+            // when clients like Zed send temperature=1.0 without top_p/top_k).
+            chain.push(LlamaSampler::top_k(40));
+            chain.push(LlamaSampler::min_p(0.05, 1));
             if let Some(top_p) = req.sampling.top_p {
                 chain.push(LlamaSampler::top_p(top_p as f32, 1));
             }
@@ -574,7 +650,8 @@ mod imp {
         };
         let prompt = format_prompt(&inner.model, &req)?;
         let vocab = inner.model.vocab();
-        let prompt_tokens = vocab.tokenize(prompt.as_bytes(), true, true);
+        let add_bos = !prompt.starts_with("<s>");
+        let prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
         let input_count = prompt_tokens.len() as u64;
         let max_new = req.sampling.max_tokens.unwrap_or(1024) as usize;
 
