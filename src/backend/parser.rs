@@ -314,7 +314,7 @@ impl NativeOutputParser {
             self.emit_func_call(events);
             return;
         }
-        if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+        if let Some(parsed) = parse_json_lenient(&raw) {
             if let Some(name) = parsed.get("name").and_then(Value::as_str) {
                 let idx = self.tool_count;
                 self.tool_count += 1;
@@ -351,8 +351,7 @@ impl NativeOutputParser {
             let name = name_part.trim();
             let args_raw = args_part.trim();
             if !name.is_empty() {
-                let args_val = serde_json::from_str::<Value>(args_raw)
-                    .ok()
+                let args_val = parse_json_lenient(args_raw)
                     .or_else(|| parse_xml_parameters(args_raw));
                 if let Some(args_val) = args_val {
                     let idx = self.tool_count;
@@ -482,9 +481,9 @@ pub fn extract_bare_tool_calls(
         None => return Vec::new(),
     };
 
-    let parsed: Value = match serde_json::from_str(json_slice) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+    let parsed: Value = match parse_json_lenient(json_slice) {
+        Some(v) => v,
+        None => return Vec::new(),
     };
 
     let items: Vec<&Value> = match &parsed {
@@ -512,6 +511,124 @@ pub fn extract_bare_tool_calls(
             let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
             out.push((name.to_string(), args_str));
         }
+    }
+    out
+}
+
+/// Strict `serde_json::from_str` first; if that fails (common on 7B–9B models writing
+/// unescaped shell quotes like `echo "EXIT=$?"` or dropping a closing `}` / adding a stray `)`),
+/// attempt a deterministic structural repair and re-parse.
+fn parse_json_lenient(raw: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        return Some(v);
+    }
+    let repaired = repair_broken_json(raw);
+    serde_json::from_str::<Value>(&repaired).ok()
+}
+
+fn repair_broken_json(raw: &str) -> String {
+    // Strip stray trailing punctuation outside the JSON object/array (e.g. `]})` -> `]}`)
+    let trimmed = raw
+        .trim()
+        .trim_end_matches(|c: char| !matches!(c, '}' | ']' | '"' | '0'..='9' | 'e' | 'l'));
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut out = String::with_capacity(trimmed.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut open_braces: i32 = 0;
+    let mut open_brackets: i32 = 0;
+
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                out.push(ch);
+                escaped = true;
+            } else if ch == '"' {
+                // Decide whether this `"` genuinely closes the JSON string or is an unescaped quote inside it.
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let is_closing = if j >= chars.len() {
+                    true
+                } else {
+                    match chars[j] {
+                        ':' | '}' | ']' => true,
+                        ',' => {
+                            // After `,`, a valid JSON separator is followed by a value/key start
+                            let mut k = j + 1;
+                            while k < chars.len() && chars[k].is_whitespace() {
+                                k += 1;
+                            }
+                            k < chars.len()
+                                && matches!(
+                                    chars[k],
+                                    '"' | '{' | '[' | '-' | '0'..='9' | 't' | 'f' | 'n'
+                                )
+                        }
+                        _ => false,
+                    }
+                };
+                if is_closing {
+                    out.push('"');
+                    in_string = false;
+                } else {
+                    out.push('\\');
+                    out.push('"');
+                }
+            } else if ch == '\n' {
+                out.push_str("\\n");
+            } else if ch == '\r' {
+                out.push_str("\\r");
+            } else if ch == '\t' {
+                out.push_str("\\t");
+            } else {
+                out.push(ch);
+            }
+        } else {
+            match ch {
+                '"' => {
+                    in_string = true;
+                    out.push(ch);
+                }
+                '{' => {
+                    open_braces += 1;
+                    out.push(ch);
+                }
+                '}' => {
+                    open_braces -= 1;
+                    out.push(ch);
+                }
+                '[' => {
+                    open_brackets += 1;
+                    out.push(ch);
+                }
+                ']' => {
+                    open_brackets -= 1;
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        i += 1;
+    }
+
+    if in_string {
+        out.push('"');
+    }
+    while open_brackets > 0 {
+        out.push(']');
+        open_brackets -= 1;
+    }
+    while open_braces > 0 {
+        out.push('}');
+        open_braces -= 1;
     }
     out
 }
@@ -641,5 +758,20 @@ mod tests {
         // Must NOT trigger for undeclared tool names
         let none = extract_bare_tool_calls(raw, &["list_directory"]);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn repairs_unescaped_shell_quotes_and_stray_closing_paren_in_tool_json() {
+        let raw = r#"The module cache has the key packages cached.
+{"name":"terminal","arguments":{"command":"GOFLAGS=-mod=mod go mod download github.com/go-redis/redis/v8 2>&1 | head -20; echo "EXIT=$?"","cd":"/Users/agungpambudi/Development/iseng/agentcode/api","timeout_ms":60000,"allow_hosts":["proxy.golang.org","sum.golang.org"]})"#;
+        let calls = extract_bare_tool_calls(raw, &["terminal", "list_directory"]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "terminal");
+        let args: Value = serde_json::from_str(&calls[0].1).expect("repaired args valid json");
+        assert_eq!(
+            args["command"].as_str().unwrap(),
+            r#"GOFLAGS=-mod=mod go mod download github.com/go-redis/redis/v8 2>&1 | head -20; echo "EXIT=$?""#
+        );
+        assert_eq!(args["timeout_ms"].as_i64().unwrap(), 60000);
     }
 }
