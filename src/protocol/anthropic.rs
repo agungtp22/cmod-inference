@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::{authorize, extract_priority};
-use crate::ir::tokens::{check_context_window, estimate_request_input_tokens};
+use crate::ir::tokens::{auto_prune_old_tool_results, check_context_window, estimate_request_input_tokens};
 use crate::ir::{
     CanonicalMessage, CanonicalRequest, CanonicalStreamEvent, ContentPart, ResponseFormat, Role,
     SamplingParams, SystemBlock, ToolChoice, ToolDefinition, UsageStats,
@@ -396,6 +396,15 @@ pub async fn messages(
                 return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
             }
         };
+
+    let pruned = auto_prune_old_tool_results(&mut canonical, state.config.backend.max_model_len);
+    if pruned > 0 {
+        tracing::info!(
+            pruned_tool_results = pruned,
+            max_model_len = state.config.backend.max_model_len,
+            "Auto-pruned old tool_result blocks to fit context window"
+        );
+    }
 
     let estimated_input = match check_context_window(&canonical, state.config.backend.max_model_len)
     {

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::auth::{authorize, extract_priority};
-use crate::ir::tokens::check_context_window;
+use crate::ir::tokens::{auto_prune_old_tool_results, check_context_window};
 use crate::ir::{
     parse_data_image_url, CanonicalMessage, CanonicalRequest, CanonicalStreamEvent, ContentPart,
     ResponseFormat, Role, SamplingParams, SystemBlock, ToolChoice, ToolDefinition,
@@ -447,6 +447,15 @@ pub async fn chat_completions(
             );
         }
     };
+
+    let pruned = auto_prune_old_tool_results(&mut canonical, state.config.backend.max_model_len);
+    if pruned > 0 {
+        tracing::info!(
+            pruned_tool_results = pruned,
+            max_model_len = state.config.backend.max_model_len,
+            "Auto-pruned old tool_result blocks to fit context window"
+        );
+    }
 
     if let Err(msg) = check_context_window(&canonical, state.config.backend.max_model_len) {
         return openai_error(
