@@ -241,7 +241,14 @@
             </div>
           </div>
           <div class="composer">
+            <div id="img-preview-bar" style="max-width:860px;margin:0 auto 8px;display:none;align-items:center;gap:8px;font-size:12px;color:var(--muted);">
+              <img id="img-preview-thumb" alt="Attached preview" style="height:40px;border-radius:6px;border:1px solid var(--border);">
+              <span id="img-preview-name"></span>
+              <button id="img-clear-btn" class="btn-mini">Remove</button>
+            </div>
             <div class="composer-inner">
+              <input id="img-file-input" type="file" accept="image/*" style="display:none">
+              <button id="img-attach-btn" class="btn" title="Attach image (for VLM models like Gemma 4)">+ Image</button>
               <textarea id="prompt-input" rows="1" placeholder="Ask anything... (Enter to send, Shift+Enter for newline)"></textarea>
               <button id="send-btn" class="btn primary">Send</button>
               <button id="stop-btn" class="btn danger" style="display:none">Stop</button>
@@ -251,8 +258,10 @@
 
         <aside class="chat-sidebar">
           <div class="field">
-            <label for="model-input">Model ID</label>
-            <input id="model-input" type="text" value="">
+            <label for="model-select">Active Model</label>
+            <select id="model-select">
+              <option value="">Loading running model...</option>
+            </select>
           </div>
           <div class="field">
             <label for="sys-input">System Prompt</label>
@@ -367,6 +376,9 @@ const state = {
   abortCtrl: null,
   recFilter: 'all',
   recCache: [],
+  pendingImageDataUrl: null,
+  pendingImageName: '',
+  modelsLoaded: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -399,7 +411,31 @@ $('temp-input').addEventListener('input', (e) => ($('temp-val').textContent = e.
 $('max-tok-input').addEventListener('input', (e) => ($('max-tok-val').textContent = e.target.value));
 $('clear-btn').addEventListener('click', () => {
   state.messages = [];
+  clearPendingImage();
   renderEmpty();
+});
+
+function clearPendingImage() {
+  state.pendingImageDataUrl = null;
+  state.pendingImageName = '';
+  $('img-file-input').value = '';
+  $('img-preview-bar').style.display = 'none';
+}
+
+$('img-attach-btn').addEventListener('click', () => $('img-file-input').click());
+$('img-clear-btn').addEventListener('click', clearPendingImage);
+$('img-file-input').addEventListener('change', (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.pendingImageDataUrl = reader.result;
+    state.pendingImageName = file.name;
+    $('img-preview-thumb').src = reader.result;
+    $('img-preview-name').textContent = file.name;
+    $('img-preview-bar').style.display = 'flex';
+  };
+  reader.readAsDataURL(file);
 });
 
 function renderEmpty() {
@@ -507,8 +543,22 @@ async function sendMessage() {
 
   input.value = '';
   input.style.height = 'auto';
-  appendMessage('user', text);
-  state.messages.push({ role: 'user', content: text });
+  const attachedImg = state.pendingImageDataUrl;
+  const attachedName = state.pendingImageName;
+  clearPendingImage();
+
+  appendMessage('user', attachedImg ? `[Image: ${attachedName}]\n${text}` : text);
+  if (attachedImg) {
+    state.messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text },
+        { type: 'image_url', image_url: { url: attachedImg } },
+      ],
+    });
+  } else {
+    state.messages.push({ role: 'user', content: text });
+  }
 
   const ui = appendMessage('assistant', '');
   ui.setMeta('Generating...');
@@ -539,7 +589,7 @@ async function sendMessage() {
       headers,
       signal: state.abortCtrl.signal,
       body: JSON.stringify({
-        model: $('model-input').value.trim() || state.activeModel,
+        model: $('model-select').value || state.activeModel,
         messages: payloadMessages,
         stream: true,
         temperature: parseFloat($('temp-input').value),
@@ -638,7 +688,9 @@ async function pollStatus() {
     state.activeModel = s.backend?.model || 'unknown';
     state.maxModelLen = s.maxModelLen || 32768;
     $('active-model-pill').textContent = `${state.activeModel} (${s.backend?.kind || ''})`;
-    if (!$('model-input').value) $('model-input').value = state.activeModel;
+    if (!state.modelsLoaded) {
+      await populateModelSelect(state.activeModel, s.backend?.detail || '');
+    }
 
     const kv = s.kvCache || {};
     const sc = s.scheduler || {};
@@ -837,6 +889,30 @@ claude`;
 `curl -N ${origin}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -d '{"model":"${m}","stream":true,"temperature":0.2,"messages":[{"role":"user","content":"Hello!"}]}'`;
+}
+
+async function populateModelSelect(runningModel, detail) {
+  const sel = $('model-select');
+  sel.replaceChildren();
+  const isVlm = detail.includes('multimodal=true');
+  const primary = document.createElement('option');
+  primary.value = runningModel;
+  primary.textContent = `● ${runningModel} (running${isVlm ? ' · VLM' : ''})`;
+  sel.append(primary);
+  try {
+    const res = await fetch('/v1/models');
+    if (res.ok) {
+      const data = await res.json();
+      for (const m of data.data || []) {
+        if (m.id === runningModel) continue;
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = `${m.id} (preset)`;
+        sel.append(opt);
+      }
+    }
+  } catch (_) {}
+  state.modelsLoaded = true;
 }
 
 pollStatus();
