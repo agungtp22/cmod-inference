@@ -421,29 +421,51 @@ impl NativeOutputParser {
                 return;
             }
         }
-        // Format B (Mistral v3 / Ministral-3): `func_name[ARGS]{"key":"val"}`
-        if let Some((name_part, args_part)) = raw.split_once("[ARGS]") {
-            let name = name_part.trim();
-            let args_raw = args_part.trim();
-            if !name.is_empty() {
-                if let Ok(args_val) = serde_json::from_str::<Value>(args_raw) {
-                    let idx = self.tool_count;
-                    self.tool_count += 1;
-                    let id = format!("call_native_{}", idx + 1);
-                    let args_str =
-                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
-                    events.push(CanonicalStreamEvent::ToolCallStart {
-                        index: idx,
-                        id,
-                        name: name.to_string(),
-                    });
-                    events.push(CanonicalStreamEvent::ToolCallDelta {
-                        index: idx,
-                        arguments_delta: args_str,
-                    });
-                    return;
+        // Format B (Mistral v3 / Ministral-3): one or more `func_name[ARGS]{"key":"val"}`
+        // segments separated by `[TOOL_CALLS]` (also strips duplicate leading `[TOOL_CALLS]`).
+        let mut emitted_any = false;
+        for segment in raw.split(MISTRAL_TOOLS_OPEN) {
+            let seg = segment.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            if let Some((name_part, args_part)) = seg.split_once("[ARGS]") {
+                let name = name_part.trim().trim_start_matches(MISTRAL_TOOLS_OPEN).trim();
+                let args_raw = args_part.trim();
+                if !name.is_empty() {
+                    if let Some(args_val) = parse_json_lenient(args_raw) {
+                        let idx = self.tool_count;
+                        self.tool_count += 1;
+                        let id = format!("call_native_{}", idx + 1);
+                        let args_str =
+                            serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                        events.push(CanonicalStreamEvent::ToolCallStart {
+                            index: idx,
+                            id,
+                            name: name.to_string(),
+                        });
+                        events.push(CanonicalStreamEvent::ToolCallDelta {
+                            index: idx,
+                            arguments_delta: args_str,
+                        });
+                        emitted_any = true;
+                    }
                 }
             }
+        }
+        if emitted_any {
+            return;
+        }
+        // Fallback: if `[TOOL_CALLS]` was followed by prose + `<tool_call>...</tool_call>`,
+        // re-parse the segment so embedded `<tool_call>` tags are still extracted cleanly.
+        if raw.contains(TOOL_OPEN) || raw.contains(FUNC_OPEN) {
+            let mut sub = NativeOutputParser::new();
+            sub.tool_count = self.tool_count;
+            let mut sub_events = sub.push(&raw);
+            sub_events.extend(sub.finish());
+            self.tool_count = sub.tool_count;
+            events.extend(sub_events);
+            return;
         }
         events.push(CanonicalStreamEvent::TextDelta(raw));
     }
@@ -773,5 +795,37 @@ mod tests {
             r#"GOFLAGS=-mod=mod go mod download github.com/go-redis/redis/v8 2>&1 | head -20; echo "EXIT=$?""#
         );
         assert_eq!(args["timeout_ms"].as_i64().unwrap(), 60000);
+    }
+
+    #[test]
+    fn parses_multiple_and_duplicate_mistral_tool_calls_and_embedded_xml() {
+        let mut p1 = NativeOutputParser::new();
+        let mut ev1 = p1.push(
+            "[TOOL_CALLS][TOOL_CALLS]find_path[ARGS]{\"glob\":\"*.go\"}[TOOL_CALLS]list_directory[ARGS]{\"path\":\".\"}",
+        );
+        ev1.extend(p1.finish());
+        let names: Vec<String> = ev1
+            .into_iter()
+            .filter_map(|e| match e {
+                CanonicalStreamEvent::ToolCallStart { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["find_path", "list_directory"]);
+
+        let mut p2 = NativeOutputParser::new();
+        let mut ev2 = p2.push(
+            "[TOOL_CALLS]I will list the root directory.<tool_call>\n{\"name\":\"list_directory\",\"arguments\":{\"path\":\"agentcode\"}}\n</tool_call>",
+        );
+        ev2.extend(p2.finish());
+        assert!(p2.had_tool_calls());
+        let names2: Vec<String> = ev2
+            .into_iter()
+            .filter_map(|e| match e {
+                CanonicalStreamEvent::ToolCallStart { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names2, vec!["list_directory"]);
     }
 }
