@@ -13,6 +13,22 @@ const GEMMA4_TOOL_CLOSE: &str = "<tool_call|>";
 const FUNC_OPEN: &str = "<function=";
 const FUNC_CLOSE: &str = "</function>";
 const MISTRAL_TOOLS_OPEN: &str = "[TOOL_CALLS]";
+// DeepSeek V3 / V3.1 / R1 native Unicode tool call tokens
+const DEEPSEEK_CALLS_OPEN: &str = "<｜tool▁calls▁begin｜>";
+const DEEPSEEK_CALLS_CLOSE: &str = "<｜tool▁calls▁end｜>";
+const DEEPSEEK_CALL_OPEN: &str = "<｜tool▁call▁begin｜>";
+const DEEPSEEK_CALL_SEP: &str = "<｜tool▁sep｜>";
+const DEEPSEEK_CALL_CLOSE: &str = "<｜tool▁call▁end｜>";
+// Kimi-K2 native tool call tokens
+const KIMI_CALL_OPEN: &str = "<|tool_call_begin|>";
+const KIMI_CALL_ARG_SEP: &str = "<|tool_call_argument_begin|>";
+const KIMI_CALL_CLOSE: &str = "<|tool_call_end|>";
+// OpenAI gpt-oss Harmony channel tokens
+const HARMONY_ANALYSIS_OPEN: &str = "<|channel|>analysis<|message|>";
+const HARMONY_FINAL_OPEN: &str = "<|channel|>final<|message|>";
+const HARMONY_COMMENTARY_OPEN: &str = "<|channel|>commentary to=";
+const HARMONY_END: &str = "<|end|>";
+const HARMONY_CALL_END: &str = "<|call|>";
 
 /// Format tool definitions into a deterministic system prompt block for native GGUF models
 /// (compatible with Qwen / Hermes / Llama / Gemma instruction-tuned models).
@@ -115,6 +131,9 @@ enum ParseState {
     InGemmaToolCall,
     InFuncCall,
     InMistralTools,
+    InDeepSeekToolCall,
+    InKimiToolCall,
+    InHarmonyToolCall,
 }
 
 /// Incremental streaming parser that separates `<think>...</think>` / `<|channel>thought...<channel|>`
@@ -165,8 +184,15 @@ impl NativeOutputParser {
                     let next_gemma_tool = self.buf.find(GEMMA4_TOOL_OPEN);
                     let next_func = self.buf.find(FUNC_OPEN);
                     let next_mistral = self.buf.find(MISTRAL_TOOLS_OPEN);
+                    let next_ds_call = self.buf.find(DEEPSEEK_CALL_OPEN);
+                    let next_ds_wrap_open = self.buf.find(DEEPSEEK_CALLS_OPEN);
+                    let next_ds_wrap_close = self.buf.find(DEEPSEEK_CALLS_CLOSE);
+                    let next_kimi = self.buf.find(KIMI_CALL_OPEN);
+                    let next_harmony_think = self.buf.find(HARMONY_ANALYSIS_OPEN);
+                    let next_harmony_final = self.buf.find(HARMONY_FINAL_OPEN);
+                    let next_harmony_tool = self.buf.find(HARMONY_COMMENTARY_OPEN);
 
-                    // Pick earliest opening tag among all supported formats
+                    // Pick earliest opening tag among all supported open-weight formats
                     let earliest = [
                         next_think.map(|i| (i, 0u8)),
                         next_tool.map(|i| (i, 1u8)),
@@ -174,6 +200,13 @@ impl NativeOutputParser {
                         next_mistral.map(|i| (i, 3u8)),
                         next_gemma_think.map(|i| (i, 4u8)),
                         next_gemma_tool.map(|i| (i, 5u8)),
+                        next_ds_call.map(|i| (i, 6u8)),
+                        next_ds_wrap_open.map(|i| (i, 7u8)),
+                        next_ds_wrap_close.map(|i| (i, 8u8)),
+                        next_kimi.map(|i| (i, 9u8)),
+                        next_harmony_think.map(|i| (i, 10u8)),
+                        next_harmony_final.map(|i| (i, 11u8)),
+                        next_harmony_tool.map(|i| (i, 12u8)),
                     ]
                     .into_iter()
                     .flatten()
@@ -191,6 +224,14 @@ impl NativeOutputParser {
                         Some((gi, 4)) => {
                             let before = self.buf[..gi].to_string();
                             self.buf.drain(..gi + GEMMA4_THINK_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.state = ParseState::InThink;
+                        }
+                        Some((hi, 10)) => {
+                            let before = self.buf[..hi].to_string();
+                            self.buf.drain(..hi + HARMONY_ANALYSIS_OPEN.len());
                             if !before.is_empty() {
                                 events.push(CanonicalStreamEvent::TextDelta(before));
                             }
@@ -232,6 +273,54 @@ impl NativeOutputParser {
                             self.tool_buf.clear();
                             self.state = ParseState::InMistralTools;
                         }
+                        Some((di, 6)) => {
+                            let before = self.buf[..di].to_string();
+                            self.buf.drain(..di + DEEPSEEK_CALL_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InDeepSeekToolCall;
+                        }
+                        Some((di, 7)) => {
+                            let before = self.buf[..di].to_string();
+                            self.buf.drain(..di + DEEPSEEK_CALLS_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                        }
+                        Some((di, 8)) => {
+                            let before = self.buf[..di].to_string();
+                            self.buf.drain(..di + DEEPSEEK_CALLS_CLOSE.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                        }
+                        Some((ki, 9)) => {
+                            let before = self.buf[..ki].to_string();
+                            self.buf.drain(..ki + KIMI_CALL_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InKimiToolCall;
+                        }
+                        Some((hi, 11)) => {
+                            let before = self.buf[..hi].to_string();
+                            self.buf.drain(..hi + HARMONY_FINAL_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                        }
+                        Some((hi, 12)) => {
+                            let before = self.buf[..hi].to_string();
+                            self.buf.drain(..hi + HARMONY_COMMENTARY_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InHarmonyToolCall;
+                        }
                         _ => {
                             let keep = longest_tag_prefix(
                                 &self.buf,
@@ -242,6 +331,13 @@ impl NativeOutputParser {
                                     GEMMA4_TOOL_OPEN,
                                     FUNC_OPEN,
                                     MISTRAL_TOOLS_OPEN,
+                                    DEEPSEEK_CALL_OPEN,
+                                    DEEPSEEK_CALLS_OPEN,
+                                    DEEPSEEK_CALLS_CLOSE,
+                                    KIMI_CALL_OPEN,
+                                    HARMONY_ANALYSIS_OPEN,
+                                    HARMONY_FINAL_OPEN,
+                                    HARMONY_COMMENTARY_OPEN,
                                 ],
                             );
                             let emit_len = self.buf.len().saturating_sub(keep);
@@ -256,9 +352,10 @@ impl NativeOutputParser {
                 }
                 ParseState::InThink => {
                     // Recover cleanly if a thinking model emits `<tool_call>` or `<function=`
-                    // while forgetting to close `</think>` / `<channel|>` first.
+                    // while forgetting to close `</think>` / `<channel|>` / `<|end|>` first.
                     let next_close = self.buf.find(THINK_CLOSE);
                     let next_gemma_close = self.buf.find(GEMMA4_THINK_CLOSE);
+                    let next_harmony_end = self.buf.find(HARMONY_END);
                     let next_tool = self.buf.find(TOOL_OPEN);
                     let next_func = self.buf.find(FUNC_OPEN);
                     let earliest = [
@@ -266,6 +363,7 @@ impl NativeOutputParser {
                         next_tool.map(|i| (i, 1u8)),
                         next_func.map(|i| (i, 2u8)),
                         next_gemma_close.map(|i| (i, 3u8)),
+                        next_harmony_end.map(|i| (i, 4u8)),
                     ]
                     .into_iter()
                     .flatten()
@@ -283,6 +381,14 @@ impl NativeOutputParser {
                         Some((end, 3)) => {
                             let think_txt = self.buf[..end].to_string();
                             self.buf.drain(..end + GEMMA4_THINK_CLOSE.len());
+                            if !think_txt.is_empty() {
+                                events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
+                            }
+                            self.state = ParseState::Normal;
+                        }
+                        Some((end, 4)) => {
+                            let think_txt = self.buf[..end].to_string();
+                            self.buf.drain(..end + HARMONY_END.len());
                             if !think_txt.is_empty() {
                                 events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
                             }
@@ -309,7 +415,13 @@ impl NativeOutputParser {
                         _ => {
                             let keep = longest_tag_prefix(
                                 &self.buf,
-                                &[THINK_CLOSE, GEMMA4_THINK_CLOSE, TOOL_OPEN, FUNC_OPEN],
+                                &[
+                                    THINK_CLOSE,
+                                    GEMMA4_THINK_CLOSE,
+                                    HARMONY_END,
+                                    TOOL_OPEN,
+                                    FUNC_OPEN,
+                                ],
                             );
                             let emit_len = self.buf.len().saturating_sub(keep);
                             if emit_len > 0 {
@@ -374,6 +486,64 @@ impl NativeOutputParser {
                     self.buf.clear();
                     break;
                 }
+                ParseState::InDeepSeekToolCall => {
+                    if let Some(end) = self.buf.find(DEEPSEEK_CALL_CLOSE) {
+                        self.tool_buf.push_str(&self.buf[..end]);
+                        self.buf.drain(..end + DEEPSEEK_CALL_CLOSE.len());
+                        self.emit_deepseek_tool_call(&mut events);
+                        self.state = ParseState::Normal;
+                    } else {
+                        let keep = longest_tag_prefix(&self.buf, &[DEEPSEEK_CALL_CLOSE]);
+                        let take_len = self.buf.len().saturating_sub(keep);
+                        if take_len > 0 {
+                            self.tool_buf.push_str(&self.buf[..take_len]);
+                            self.buf.drain(..take_len);
+                        }
+                        break;
+                    }
+                }
+                ParseState::InKimiToolCall => {
+                    if let Some(end) = self.buf.find(KIMI_CALL_CLOSE) {
+                        self.tool_buf.push_str(&self.buf[..end]);
+                        self.buf.drain(..end + KIMI_CALL_CLOSE.len());
+                        self.emit_kimi_tool_call(&mut events);
+                        self.state = ParseState::Normal;
+                    } else {
+                        let keep = longest_tag_prefix(&self.buf, &[KIMI_CALL_CLOSE]);
+                        let take_len = self.buf.len().saturating_sub(keep);
+                        if take_len > 0 {
+                            self.tool_buf.push_str(&self.buf[..take_len]);
+                            self.buf.drain(..take_len);
+                        }
+                        break;
+                    }
+                }
+                ParseState::InHarmonyToolCall => {
+                    let next_call = self.buf.find(HARMONY_CALL_END);
+                    let next_end = self.buf.find(HARMONY_END);
+                    let earliest = [
+                        next_call.map(|i| (i, HARMONY_CALL_END.len())),
+                        next_end.map(|i| (i, HARMONY_END.len())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|(i, _)| *i);
+
+                    if let Some((end, tag_len)) = earliest {
+                        self.tool_buf.push_str(&self.buf[..end]);
+                        self.buf.drain(..end + tag_len);
+                        self.emit_harmony_tool_call(&mut events);
+                        self.state = ParseState::Normal;
+                    } else {
+                        let keep = longest_tag_prefix(&self.buf, &[HARMONY_CALL_END, HARMONY_END]);
+                        let take_len = self.buf.len().saturating_sub(keep);
+                        if take_len > 0 {
+                            self.tool_buf.push_str(&self.buf[..take_len]);
+                            self.buf.drain(..take_len);
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -415,6 +585,21 @@ impl NativeOutputParser {
                 self.buf.clear();
                 self.emit_mistral_tools(&mut events);
             }
+            ParseState::InDeepSeekToolCall => {
+                self.tool_buf.push_str(&self.buf);
+                self.buf.clear();
+                self.emit_deepseek_tool_call(&mut events);
+            }
+            ParseState::InKimiToolCall => {
+                self.tool_buf.push_str(&self.buf);
+                self.buf.clear();
+                self.emit_kimi_tool_call(&mut events);
+            }
+            ParseState::InHarmonyToolCall => {
+                self.tool_buf.push_str(&self.buf);
+                self.buf.clear();
+                self.emit_harmony_tool_call(&mut events);
+            }
         }
         events
     }
@@ -431,6 +616,32 @@ impl NativeOutputParser {
             self.tool_buf = inner.to_string();
             self.emit_func_call(events);
             return;
+        }
+        // Handle GLM-4.5 `<tool_call>NAME\n<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+        if raw.contains("<arg_key>") {
+            if let Some((name_part, args_part)) = raw.split_once("<arg_key>") {
+                let name = name_part.trim();
+                let args_raw = format!("<arg_key>{args_part}");
+                if !name.is_empty() {
+                    if let Some(args_val) = parse_glm_arg_pairs(&args_raw) {
+                        let idx = self.tool_count;
+                        self.tool_count += 1;
+                        let id = format!("call_native_{}", idx + 1);
+                        let args_str = serde_json::to_string(&args_val)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        events.push(CanonicalStreamEvent::ToolCallStart {
+                            index: idx,
+                            id,
+                            name: name.to_string(),
+                        });
+                        events.push(CanonicalStreamEvent::ToolCallDelta {
+                            index: idx,
+                            arguments_delta: args_str,
+                        });
+                        return;
+                    }
+                }
+            }
         }
         if let Some(parsed) = parse_json_lenient(&raw) {
             if let Some(name) = parsed.get("name").and_then(Value::as_str) {
@@ -622,6 +833,154 @@ impl NativeOutputParser {
             return;
         }
         events.push(CanonicalStreamEvent::TextDelta(raw));
+    }
+
+    /// Parse DeepSeek V3 / V3.1 / R1 native `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json\n{...}\n```<｜tool▁call▁end｜>`.
+    fn emit_deepseek_tool_call(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
+        let raw = self.tool_buf.trim().to_string();
+        self.tool_buf.clear();
+        if raw.is_empty() {
+            return;
+        }
+        let body = raw
+            .split_once(DEEPSEEK_CALL_SEP)
+            .map(|(_, after)| after.trim())
+            .unwrap_or(raw.as_str());
+        if let Some((name_line, rest)) = body.split_once('\n') {
+            let name = name_line.trim();
+            let args_candidate = rest
+                .trim()
+                .strip_prefix("```json")
+                .or_else(|| rest.trim().strip_prefix("```"))
+                .and_then(|s| s.strip_suffix("```"))
+                .map(str::trim)
+                .unwrap_or_else(|| rest.trim());
+            if !name.is_empty() {
+                if let Some(args_val) = parse_json_lenient(args_candidate) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args_str =
+                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    return;
+                }
+            }
+        }
+        events.push(CanonicalStreamEvent::TextDelta(raw));
+    }
+
+    /// Parse Kimi-K2 `<|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>{...}<|tool_call_end|>`.
+    fn emit_kimi_tool_call(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
+        let raw = self.tool_buf.trim().to_string();
+        self.tool_buf.clear();
+        if let Some((id_part, args_part)) = raw.split_once(KIMI_CALL_ARG_SEP) {
+            let name_clean = id_part
+                .trim()
+                .strip_prefix("functions.")
+                .unwrap_or_else(|| id_part.trim());
+            let name = name_clean
+                .split_once(':')
+                .map(|(n, _)| n)
+                .unwrap_or(name_clean)
+                .trim();
+            if !name.is_empty() {
+                if let Some(args_val) = parse_json_lenient(args_part.trim()) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args_str =
+                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    return;
+                }
+            }
+        }
+        if !raw.is_empty() {
+            events.push(CanonicalStreamEvent::TextDelta(raw));
+        }
+    }
+
+    /// Parse OpenAI `gpt-oss` Harmony `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{...}<|call|>`.
+    fn emit_harmony_tool_call(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
+        let raw = self.tool_buf.trim().to_string();
+        self.tool_buf.clear();
+        if let Some((header, msg_body)) = raw.split_once("<|message|>") {
+            let target = header.split_whitespace().next().unwrap_or("").trim();
+            let name = target.strip_prefix("functions.").unwrap_or(target).trim();
+            if !name.is_empty() {
+                if let Some(args_val) = parse_json_lenient(msg_body.trim()) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args_str =
+                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    return;
+                }
+            }
+        }
+        if !raw.is_empty() {
+            events.push(CanonicalStreamEvent::TextDelta(raw));
+        }
+    }
+}
+
+/// Parse GLM-4.5 `<arg_key>k</arg_key><arg_value>v</arg_value>` pairs into a JSON object.
+fn parse_glm_arg_pairs(raw: &str) -> Option<Value> {
+    const K_OPEN: &str = "<arg_key>";
+    const K_CLOSE: &str = "</arg_key>";
+    const V_OPEN: &str = "<arg_value>";
+    const V_CLOSE: &str = "</arg_value>";
+    let mut map = serde_json::Map::new();
+    let mut rest = raw;
+    while let Some(ks) = rest.find(K_OPEN) {
+        let after_k = &rest[ks + K_OPEN.len()..];
+        let (key, after_kc) = after_k.split_once(K_CLOSE)?;
+        let vs = after_kc.find(V_OPEN)?;
+        let after_v = &after_kc[vs + V_OPEN.len()..];
+        let (val_raw, remaining) = match after_v.find(V_CLOSE) {
+            Some(end) => (&after_v[..end], &after_v[end + V_CLOSE.len()..]),
+            None => (after_v, ""),
+        };
+        let trimmed = val_raw.trim();
+        let parsed = match serde_json::from_str::<Value>(trimmed) {
+            Ok(v @ (Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_))) => v,
+            _ => Value::String(trimmed.to_string()),
+        };
+        if !key.trim().is_empty() {
+            map.insert(key.trim().to_string(), parsed);
+        }
+        rest = remaining;
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
     }
 }
 
@@ -902,7 +1261,10 @@ fn longest_tag_prefix(buf: &str, tags: &[&str]) -> usize {
     for tag in tags {
         let max_check = buf.len().min(tag.len().saturating_sub(1));
         for len in (1..=max_check).rev() {
-            if buf.is_char_boundary(buf.len() - len) && buf.ends_with(&tag[..len]) {
+            if buf.is_char_boundary(buf.len() - len)
+                && tag.is_char_boundary(len)
+                && buf.ends_with(&tag[..len])
+            {
                 best = best.max(len);
                 break;
             }
@@ -1064,5 +1426,41 @@ mod tests {
         assert_eq!(parsed["command"], "go version");
         assert_eq!(parsed["cd"], "/tmp/app");
         assert_eq!(parsed["timeout_ms"], 5000);
+    }
+
+    #[test]
+    fn parses_deepseek_v3_kimi_k2_glm45_and_harmony_gpt_oss() {
+        // 1. DeepSeek V3 / R1 native
+        let mut ds = NativeOutputParser::new();
+        let mut ev_ds = ds.push(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>terminal\n```json\n{\"command\":\"go test ./...\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        );
+        ev_ds.extend(ds.finish());
+        assert!(ds.had_tool_calls());
+
+        // 2. Kimi-K2
+        let mut km = NativeOutputParser::new();
+        let mut ev_km = km.push(
+            "<|tool_call_begin|>functions.read_file:0<|tool_call_argument_begin|>{\"path\":\"main.go\"}<|tool_call_end|>",
+        );
+        ev_km.extend(km.finish());
+        assert!(km.had_tool_calls());
+
+        // 3. GLM-4.5
+        let mut glm = NativeOutputParser::new();
+        let mut ev_glm = glm.push(
+            "<tool_call>list_directory\n<arg_key>path</arg_key><arg_value>/tmp</arg_value></tool_call>",
+        );
+        ev_glm.extend(glm.finish());
+        assert!(glm.had_tool_calls());
+
+        // 4. OpenAI gpt-oss Harmony
+        let mut hm = NativeOutputParser::new();
+        let mut ev_hm = hm.push(
+            "<|channel|>analysis<|message|>Need git status<|end|><|channel|>commentary to=functions.terminal <|constrain|>json<|message|>{\"command\":\"git status\"}<|call|>",
+        );
+        ev_hm.extend(hm.finish());
+        assert!(hm.had_tool_calls());
+        assert!(ev_hm.iter().any(|e| matches!(e, CanonicalStreamEvent::ThinkingDelta(t) if t.contains("Need git status"))));
     }
 }
