@@ -150,7 +150,79 @@ Measured head-to-head against **Ollama `v0.40.16`** using the **exact same GGUF 
 
 ## Build & Installation
 
-### Build from Source
+### Option 1: Pre-built Binaries (GitHub Actions)
+
+Every push to `main` automatically builds and publishes standalone release binaries on [GitHub Actions](https://github.com/agungtp22/cmod-inference/actions/workflows/ci.yml):
+
+| Platform | Architecture | Included Features | Artifact Name |
+|---|---|---|---|
+| **macOS** | Apple Silicon (`arm64` only) | `metal` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-macos-arm64` |
+| **Linux** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64` |
+| **Windows** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-windows-x86_64` |
+
+#### Download from GitHub Actions UI
+1. Open [Actions → CI](https://github.com/agungtp22/cmod-inference/actions/workflows/ci.yml) and click the latest green run on `main`.
+2. Scroll to **Artifacts** and download the zip for your OS.
+
+*(Or download via [GitHub CLI](https://cli.github.com/):)*
+```bash
+# macOS Apple Silicon (ARM64)
+gh run download -R agungtp22/cmod-inference -n cmod-inference-macos-arm64 -D /tmp/cmod-bin
+
+# Linux x86_64
+gh run download -R agungtp22/cmod-inference -n cmod-inference-linux-x86_64 -D /tmp/cmod-bin
+
+# Windows x86_64 (PowerShell)
+gh run download -R agungtp22/cmod-inference -n cmod-inference-windows-x86_64 -D "$env:TEMP\cmod-bin"
+```
+
+#### Install the Downloaded Binary
+
+**macOS (Apple Silicon ARM64):**
+```bash
+unzip cmod-inference-macos-arm64.zip -d /tmp/cmod-bin
+mkdir -p ~/.local/bin
+rm -f ~/.local/bin/cmod-inference
+cp /tmp/cmod-bin/cmod-inference ~/.local/bin/cmod-inference
+chmod +x ~/.local/bin/cmod-inference
+xattr -d com.apple.quarantine ~/.local/bin/cmod-inference 2>/dev/null || true
+ln -sf ~/.local/bin/cmod-inference ~/.local/bin/cmod
+
+# Ensure ~/.local/bin is in PATH (add to ~/.zshrc if needed)
+export PATH="$HOME/.local/bin:$PATH"
+cmod --version
+```
+
+**Linux (x86_64):**
+```bash
+unzip cmod-inference-linux-x86_64.zip -d /tmp/cmod-bin
+mkdir -p ~/.local/bin
+install -m 755 /tmp/cmod-bin/cmod-inference ~/.local/bin/cmod-inference
+ln -sf ~/.local/bin/cmod-inference ~/.local/bin/cmod
+
+# Ensure ~/.local/bin is in PATH (add to ~/.bashrc or ~/.zshrc if needed)
+export PATH="$HOME/.local/bin:$PATH"
+cmod --version
+```
+
+**Windows (PowerShell):**
+```powershell
+Expand-Archive cmod-inference-windows-x86_64.zip -DestinationPath "$env:LOCALAPPDATA\cmod\bin" -Force
+Copy-Item "$env:LOCALAPPDATA\cmod\bin\cmod-inference.exe" "$env:LOCALAPPDATA\cmod\bin\cmod.exe" -Force
+
+# Add to User PATH (restart terminal after running once)
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$env:LOCALAPPDATA\cmod\bin*") {
+  [Environment]::SetEnvironmentVariable("Path", "$userPath;$env:LOCALAPPDATA\cmod\bin", "User")
+}
+cmod --version
+```
+
+> **Need NVIDIA CUDA, AMD ROCm, or Vulkan GPU acceleration on Linux/Windows?** Build from source with the matching feature flag below.
+
+---
+
+### Option 2: Build from Source
 
 Choose the Cargo feature matching your hardware:
 
@@ -171,10 +243,11 @@ cargo build --release --features "vulkan multimodal"
 cargo build --release --features "native grammar multimodal"
 ```
 
-Install the CLI to your `PATH`:
+Install the CLI to your `PATH` (always `rm -f` first on macOS so AMFI code-signature stays valid):
 
 ```bash
 mkdir -p ~/.local/bin
+rm -f ~/.local/bin/cmod-inference
 cp target/release/cmod-inference ~/.local/bin/cmod-inference
 ln -sf ~/.local/bin/cmod-inference ~/.local/bin/cmod
 ```
@@ -183,23 +256,25 @@ ln -sf ~/.local/bin/cmod-inference ~/.local/bin/cmod
 
 ## Quick Start
 
+Models pulled via `cmod pull` are stored globally in **`~/.cmod/models`** (override with `--models-dir` or `CMOD_INFERENCE_MODELS_DIR`), so `cmod list` and `cmod serve` work from any directory:
+
 ```bash
 # 1. Inspect hardware & get model recommendations for your GPU/VRAM
 cmod hardware
 cmod recommend
 
-# 2. Download a curated GGUF model (e.g., 4B non-thinking or 0.6B tiny)
+# 2. Download a curated GGUF model to ~/.cmod/models
 cmod pull qwen3-4b-doc
 cmod list
 
 # 3. Start the Native Metal/CUDA server with 3-Tier KV-Cache
 cmod serve \
   --backend native \
-  --model-path ./models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  --model-path Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
   --model qwen3-4b-doc \
   --ctx 8192 \
   --slots 2 \
-  --kv-cache-dir ./kvcache
+  --kv-cache-dir ~/.cmod/kvcache
 
 # 4. Check live server status, slots, and L1/L2/L3 KV-Cache hits (like `ollama ps`)
 cmod ps
