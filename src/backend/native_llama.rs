@@ -7,7 +7,9 @@ mod imp {
     use std::sync::Arc;
 
     use anyhow::{anyhow, Context, Result};
-    use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
+    use llama_cpp_2::context::params::{
+        KvCacheType, LlamaContextParams, LlamaContextType, LlamaPoolingType,
+    };
     use llama_cpp_2::context::session::LlamaStateSeqFlags;
     use llama_cpp_2::context::LlamaContext;
     use llama_cpp_2::llama_backend::LlamaBackend;
@@ -15,6 +17,7 @@ mod imp {
     use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
     use llama_cpp_2::model::{LlamaChatMessage, LlamaLoraAdapter, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
+    use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
     use llama_cpp_2::token::LlamaToken;
     use tokio::sync::mpsc;
     use tracing::{info, warn};
@@ -53,6 +56,9 @@ mod imp {
         #[cfg(feature = "multimodal")]
         mmproj_path: Option<String>,
         lora_adapter: Option<(std::sync::Mutex<LlamaLoraAdapter>, f32, String)>,
+        enable_mtp: bool,
+        draft_model: Option<LlamaModel>,
+        draft_max: usize,
     }
 
     unsafe impl Send for NativeEngineInner {}
@@ -216,6 +222,29 @@ mod imp {
                 Some(cfg.mmproj_path.trim().to_string())
             };
 
+            let draft_model = if !cfg.draft_model_path.trim().is_empty() {
+                let dm_p = Path::new(cfg.draft_model_path.trim());
+                if !dm_p.exists() {
+                    return Err(anyhow!(
+                        "File draft model GGUF tidak ditemukan: {}",
+                        dm_p.display()
+                    ));
+                }
+                let dm_params = LlamaModelParams::default()
+                    .with_n_gpu_layers(gpu_layers)
+                    .with_main_gpu(cfg.main_gpu);
+                let dm = LlamaModel::load_from_file(&backend, dm_p, &dm_params)
+                    .with_context(|| format!("gagal memuat draft model GGUF {}", dm_p.display()))?;
+                info!(
+                    draft_model = %dm_p.display(),
+                    draft_max = cfg.draft_max,
+                    "Draft model GGUF untuk speculative decoding berhasil dimuat in-process"
+                );
+                Some(dm)
+            } else {
+                None
+            };
+
             let inner = Arc::new(NativeEngineInner {
                 backend,
                 model,
@@ -234,6 +263,9 @@ mod imp {
                 #[cfg(feature = "multimodal")]
                 mmproj_path,
                 lora_adapter,
+                enable_mtp: cfg.enable_mtp,
+                draft_model,
+                draft_max: cfg.draft_max.clamp(1, 16) as usize,
             });
 
             // Spawn `pool_size` persistent worker threads sequentially so GPU backends
@@ -268,28 +300,92 @@ mod imp {
         ready_tx: std::sync::mpsc::SyncSender<Result<()>>,
     ) {
         let batch_cap_u32 = inner.max_model_len.min(2048);
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(inner.max_model_len))
-            .with_n_batch(batch_cap_u32)
-            .with_n_threads(inner.n_threads)
-            .with_n_threads_batch(inner.n_threads)
-            .with_type_k(inner.kv_cache_quant)
-            .with_type_v(inner.kv_cache_quant);
-
-        let mut ctx = match inner.model.new_context(&inner.backend, ctx_params) {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(slot_idx, "gagal pre-alokasi LlamaContext VRAM pool: {err}");
-                let _ = ready_tx.send(Err(anyhow!(
-                    "gagal pre-alokasi LlamaContext slot {slot_idx}: {err}"
-                )));
-                return;
+        let make_target_params = |with_mtp: bool| {
+            let mut p = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(inner.max_model_len))
+                .with_n_batch(batch_cap_u32)
+                .with_n_threads(inner.n_threads)
+                .with_n_threads_batch(inner.n_threads)
+                .with_type_k(inner.kv_cache_quant)
+                .with_type_v(inner.kv_cache_quant);
+            if with_mtp {
+                p = p.with_n_rs_seq(2);
             }
+            p
         };
+
+        // Optional same-model MTP speculative context (when `--mtp` is enabled and no external draft model is set)
+        let mut mtp_ctx: Option<MtpSpeculative<'_>> = None;
+        let mut plain_ctx: Option<LlamaContext<'_>> = None;
+
+        if inner.enable_mtp && inner.draft_model.is_none() {
+            let target_try = inner
+                .model
+                .new_context(&inner.backend, make_target_params(true));
+            let draft_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(inner.max_model_len))
+                .with_n_batch(batch_cap_u32)
+                .with_n_threads(inner.n_threads)
+                .with_n_threads_batch(inner.n_threads)
+                .with_context_type(LlamaContextType::Mtp);
+            let draft_try = inner.model.new_context(&inner.backend, draft_params);
+            match (target_try, draft_try) {
+                (Ok(t_ctx), Ok(d_ctx)) => {
+                    let params = MtpSpeculativeParams {
+                        n_max: inner.draft_max as i32,
+                        n_min: 0,
+                        p_min: 0.0,
+                    };
+                    match MtpSpeculative::new(t_ctx, d_ctx, params) {
+                        Ok(spec) => {
+                            info!(
+                                slot_idx,
+                                draft_max = inner.draft_max,
+                                "Same-model MTP speculative decoding aktif di worker slot"
+                            );
+                            mtp_ctx = Some(spec);
+                        }
+                        Err(e) => {
+                            warn!(
+                                slot_idx,
+                                "Model GGUF ini tidak memiliki head MTP native ({e}); fallback ke decode standar"
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    warn!(
+                        slot_idx,
+                        "Gagal inisialisasi context MTP; fallback ke decode standar"
+                    );
+                }
+            }
+        }
+
+        if mtp_ctx.is_none() {
+            match inner
+                .model
+                .new_context(&inner.backend, make_target_params(false))
+            {
+                Ok(c) => plain_ctx = Some(c),
+                Err(err) => {
+                    warn!(slot_idx, "gagal pre-alokasi LlamaContext VRAM pool: {err}");
+                    let _ = ready_tx.send(Err(anyhow!(
+                        "gagal pre-alokasi LlamaContext slot {slot_idx}: {err}"
+                    )));
+                    return;
+                }
+            }
+        }
 
         if let Some((ref adapter_mtx, scale, ref path_label)) = inner.lora_adapter {
             let mut guard = adapter_mtx.lock().unwrap();
-            if let Err(err) = ctx.lora_adapter_set(&mut guard, scale) {
+            let target_mut = if let Some(ref mut m) = mtp_ctx {
+                m.target_context_mut()
+            } else {
+                plain_ctx.as_mut().unwrap()
+            };
+            if let Err(err) = target_mut.lora_adapter_set(&mut guard, scale) {
                 warn!(slot_idx, lora = %path_label, "gagal memasang LoRA adapter ke slot: {err:?}");
                 let _ = ready_tx.send(Err(anyhow!(
                     "gagal memasang LoRA adapter {} ke slot {slot_idx}: {err:?}",
@@ -299,6 +395,28 @@ mod imp {
             }
             info!(slot_idx, lora = %path_label, scale, "LoRA adapter aktif di worker slot");
         }
+
+        let mut ext_draft_ctx = if let Some(ref dm) = inner.draft_model {
+            let d_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(inner.max_model_len))
+                .with_n_batch(batch_cap_u32)
+                .with_n_threads(inner.n_threads)
+                .with_n_threads_batch(inner.n_threads)
+                .with_type_k(inner.kv_cache_quant)
+                .with_type_v(inner.kv_cache_quant);
+            match dm.new_context(&inner.backend, d_params) {
+                Ok(c) => {
+                    info!(slot_idx, "External draft model context siap di worker slot");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!(slot_idx, "gagal membuat draft context: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Quick Win #5: pre-load persistent MtmdContext once per worker slot (avoids reloading mmproj per image request)
         #[cfg(feature = "multimodal")]
@@ -327,16 +445,32 @@ mod imp {
 
         while let Ok(job) = rx.recv() {
             let err_tx = job.tx.clone();
-            if let Err(err) = execute_on_context(
-                &inner,
-                &mut ctx,
-                #[cfg(feature = "multimodal")]
-                mtmd_ctx.as_mut(),
-                &mut l1_tokens,
-                &mut l1_valid,
-                job.req,
-                job.tx,
-            ) {
+            let res = if let Some(ref mut mtp) = mtp_ctx {
+                execute_on_context(
+                    &inner,
+                    mtp.target_context_mut(),
+                    None,
+                    #[cfg(feature = "multimodal")]
+                    mtmd_ctx.as_mut(),
+                    &mut l1_tokens,
+                    &mut l1_valid,
+                    job.req,
+                    job.tx,
+                )
+            } else {
+                execute_on_context(
+                    &inner,
+                    plain_ctx.as_mut().unwrap(),
+                    ext_draft_ctx.as_mut(),
+                    #[cfg(feature = "multimodal")]
+                    mtmd_ctx.as_mut(),
+                    &mut l1_tokens,
+                    &mut l1_valid,
+                    job.req,
+                    job.tx,
+                )
+            };
+            if let Err(err) = res {
                 l1_valid = false;
                 let _ = err_tx.send(Err(err));
             }
@@ -765,6 +899,7 @@ mod imp {
     fn execute_on_context(
         inner: &NativeEngineInner,
         ctx: &mut LlamaContext<'_>,
+        mut draft_ctx_opt: Option<&mut LlamaContext<'_>>,
         #[cfg(feature = "multimodal")] mut mtmd_ctx_opt: Option<&mut llama_cpp_2::mtmd::MtmdContext>,
         l1_tokens: &mut Vec<LlamaToken>,
         l1_valid: &mut bool,
@@ -993,28 +1128,52 @@ mod imp {
         let mut accumulated = String::new();
         let mut stop_reason = StopReason::EndTurn;
         let is_forced_tool = forced_tool_schema.is_some();
+        let use_ext_draft = draft_ctx_opt.is_some()
+            && !is_forced_tool
+            && matches!(req.response_format, ResponseFormat::Text)
+            && raw_images.is_empty();
 
-        for _ in 0..max_new {
-            // Note: LlamaSampler::sample() already calls accept(token) internally!
-            // Calling sampler.accept(token) again would double-feed stateful samplers like llguidance.
-            let token = sampler.sample(ctx, last_logit_idx);
+        // Prefill external draft model context when speculative decoding is active
+        let mut draft_n_cur: i32 = 0;
+        let mut draft_last_idx: i32 = 0;
+        let mut draft_batch = LlamaBatch::new(batch_cap, 1);
+        let mut draft_sampler = LlamaSampler::greedy();
+        let mut spec_drafted: u64 = 0;
+        let mut spec_accepted: u64 = 0;
 
-            if vocab.is_eog(token) {
-                stop_reason = StopReason::EndTurn;
-                break;
+        if use_ext_draft {
+            if let Some(d_ctx) = draft_ctx_opt.as_deref_mut() {
+                d_ctx.clear_kv_cache();
+                let total_prompt = prompt_tokens.len();
+                for chunk_start in (0..total_prompt).step_by(batch_cap) {
+                    draft_batch.clear();
+                    let chunk_end = (chunk_start + batch_cap).min(total_prompt);
+                    for (offset, &tok) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
+                        let pos = (chunk_start + offset) as i32;
+                        let is_last = pos as usize == total_prompt - 1;
+                        draft_batch.add(tok, pos, &[0], is_last)?;
+                    }
+                    d_ctx
+                        .decode(&mut draft_batch)
+                        .context("gagal prefill prompt draft model")?;
+                }
+                draft_n_cur = total_prompt as i32;
+                draft_last_idx = draft_batch.n_tokens() - 1;
             }
+        }
 
-            if *l1_valid {
-                l1_tokens.push(token);
-            }
-
-            // Pass `special = true` so model-native special tags like `<tool_call>`, `</tool_call>`,
-            // `<think>`, and `</think>` are rendered for `NativeOutputParser` (EOG tokens already broke above).
+        let mut emit_token = |token: LlamaToken,
+                              utf8_buf: &mut Vec<u8>,
+                              accumulated: &mut String,
+                              parser: &mut NativeOutputParser,
+                              output_count: &mut u64,
+                              stop_reason: &mut StopReason|
+         -> Option<bool> {
             let piece = vocab.token_to_piece(token, true, None);
             utf8_buf.extend_from_slice(&piece);
-            output_count += 1;
+            *output_count += 1;
 
-            let valid_len = match std::str::from_utf8(&utf8_buf) {
+            let valid_len = match std::str::from_utf8(utf8_buf) {
                 Ok(_) => utf8_buf.len(),
                 Err(e) => e.valid_up_to(),
             };
@@ -1029,29 +1188,166 @@ mod imp {
                     .iter()
                     .any(|s| !s.is_empty() && accumulated.ends_with(s))
                 {
-                    stop_reason = StopReason::StopSequence;
-                    break;
+                    *stop_reason = StopReason::StopSequence;
+                    return Some(true);
                 }
 
                 if !is_forced_tool {
                     for ev in parser.push(&text) {
                         if tx.send(Ok(ev)).is_err() {
-                            return Ok(());
+                            return None;
                         }
                     }
                 }
             }
-
-            if output_count as usize >= max_new {
-                stop_reason = StopReason::MaxTokens;
-                break;
+            if *output_count as usize >= max_new {
+                *stop_reason = StopReason::MaxTokens;
+                return Some(true);
             }
+            Some(false)
+        };
 
-            batch.clear();
-            batch.add(token, n_cur, &[0], true)?;
-            n_cur += 1;
-            ctx.decode(&mut batch).context("gagal decode token")?;
-            last_logit_idx = batch.n_tokens() - 1;
+        if use_ext_draft {
+            let d_ctx = draft_ctx_opt.as_deref_mut().unwrap();
+            let draft_k = inner.draft_max.min(16);
+
+            // First token comes directly from target model
+            let mut cur_token = sampler.sample(ctx, last_logit_idx);
+            while !vocab.is_eog(cur_token) {
+                if *l1_valid {
+                    l1_tokens.push(cur_token);
+                }
+                match emit_token(
+                    cur_token,
+                    &mut utf8_buf,
+                    &mut accumulated,
+                    &mut parser,
+                    &mut output_count,
+                    &mut stop_reason,
+                ) {
+                    None => return Ok(()),
+                    Some(true) => break,
+                    Some(false) => {}
+                }
+
+                // 1. Propose up to `draft_k` speculative tokens using the fast draft model
+                let mut drafted: Vec<LlamaToken> = Vec::with_capacity(draft_k);
+                let mut d_tok = cur_token;
+                let draft_base_pos = draft_n_cur;
+                for _ in 0..draft_k {
+                    draft_batch.clear();
+                    draft_batch.add(d_tok, draft_n_cur, &[0], true)?;
+                    draft_n_cur += 1;
+                    d_ctx.decode(&mut draft_batch).context("gagal decode draft")?;
+                    draft_last_idx = draft_batch.n_tokens() - 1;
+                    let proposed = draft_sampler.sample(d_ctx, draft_last_idx);
+                    if vocab.is_eog(proposed) {
+                        break;
+                    }
+                    drafted.push(proposed);
+                    d_tok = proposed;
+                }
+                spec_drafted += drafted.len() as u64;
+
+                // 2. Verify `[cur_token, drafted...]` in ONE parallel forward pass on the target model
+                batch.clear();
+                let target_base_pos = n_cur;
+                batch.add(cur_token, n_cur, &[0], true)?;
+                n_cur += 1;
+                for &dt in &drafted {
+                    batch.add(dt, n_cur, &[0], true)?;
+                    n_cur += 1;
+                }
+                ctx.decode(&mut batch)
+                    .context("gagal verifikasi batch speculative")?;
+
+                // 3. Accept matching prefix + 1 bonus token from target model
+                let mut n_accepted = 0usize;
+                let mut next_token = sampler.sample(ctx, 0);
+                let mut hit_stop = false;
+
+                for (i, &dt) in drafted.iter().enumerate() {
+                    if next_token == dt {
+                        n_accepted += 1;
+                        spec_accepted += 1;
+                        if *l1_valid {
+                            l1_tokens.push(dt);
+                        }
+                        match emit_token(
+                            dt,
+                            &mut utf8_buf,
+                            &mut accumulated,
+                            &mut parser,
+                            &mut output_count,
+                            &mut stop_reason,
+                        ) {
+                            None => return Ok(()),
+                            Some(true) => {
+                                hit_stop = true;
+                                break;
+                            }
+                            Some(false) => {}
+                        }
+                        next_token = sampler.sample(ctx, (i + 1) as i32);
+                    } else {
+                        break;
+                    }
+                }
+
+                // Roll back rejected tail in both target & draft KV caches
+                let kept_target_end = target_base_pos + 1 + n_accepted as i32;
+                if kept_target_end < n_cur {
+                    let _ = ctx.clear_kv_cache_seq(Some(0), Some(kept_target_end as u32), None);
+                    n_cur = kept_target_end;
+                }
+                let kept_draft_end = draft_base_pos + 1 + n_accepted as i32;
+                if kept_draft_end < draft_n_cur {
+                    let _ = d_ctx.clear_kv_cache_seq(Some(0), Some(kept_draft_end as u32), None);
+                    draft_n_cur = kept_draft_end;
+                }
+
+                if hit_stop {
+                    break;
+                }
+                cur_token = next_token;
+            }
+            if vocab.is_eog(cur_token) {
+                stop_reason = StopReason::EndTurn;
+            }
+        } else {
+            for _ in 0..max_new {
+                // Note: LlamaSampler::sample() already calls accept(token) internally!
+                // Calling sampler.accept(token) again would double-feed stateful samplers like llguidance.
+                let token = sampler.sample(ctx, last_logit_idx);
+
+                if vocab.is_eog(token) {
+                    stop_reason = StopReason::EndTurn;
+                    break;
+                }
+
+                if *l1_valid {
+                    l1_tokens.push(token);
+                }
+
+                match emit_token(
+                    token,
+                    &mut utf8_buf,
+                    &mut accumulated,
+                    &mut parser,
+                    &mut output_count,
+                    &mut stop_reason,
+                ) {
+                    None => return Ok(()),
+                    Some(true) => break,
+                    Some(false) => {}
+                }
+
+                batch.clear();
+                batch.add(token, n_cur, &[0], true)?;
+                n_cur += 1;
+                ctx.decode(&mut batch).context("gagal decode token")?;
+                last_logit_idx = batch.n_tokens() - 1;
+            }
         }
 
         if is_forced_tool {
@@ -1114,6 +1410,11 @@ mod imp {
 
         let decode_secs = decode_started.elapsed().as_secs_f64().max(0.001);
         let decode_tps = output_count as f64 / decode_secs;
+        let spec_acc_pct = if spec_drafted > 0 {
+            format!("{:.0}%", (spec_accepted as f64 / spec_drafted as f64) * 100.0)
+        } else {
+            "off".to_string()
+        };
         info!(
             model = %inner.model_id,
             in_tok = input_count,
@@ -1121,6 +1422,7 @@ mod imp {
             out_tok = output_count,
             prefill_ms,
             decode_tps = format!("{decode_tps:.1}"),
+            spec_acc = %spec_acc_pct,
             "Request selesai"
         );
 
@@ -1290,13 +1592,21 @@ mod imp {
                 #[cfg(not(feature = "multimodal"))]
                 let mm = false;
 
+                let spec_label = if inner.draft_model.is_some() {
+                    format!("draft(max={})", inner.draft_max)
+                } else if inner.enable_mtp {
+                    format!("mtp(max={})", inner.draft_max)
+                } else {
+                    "off".to_string()
+                };
+
                 BackendHealth {
                     ready: true,
                     kind: active_accelerator_label().to_string(),
                     upstream_url: format!("in-process://{}", inner.model_path),
                     model: inner.model_id.clone(),
                     detail: Some(format!(
-                        "vram_slots={}, ctx={}, gpu_layers={}, split={}, moe_offload={}, fp={}, grammar={}, multimodal={}, lora={}",
+                        "vram_slots={}, ctx={}, gpu_layers={}, split={}, moe_offload={}, fp={}, grammar={}, multimodal={}, lora={}, spec={}",
                         slots,
                         inner.max_model_len,
                         inner.gpu_layers,
@@ -1305,7 +1615,8 @@ mod imp {
                         inner.model_fingerprint,
                         cfg!(feature = "grammar"),
                         mm,
-                        inner.lora_adapter.is_some()
+                        inner.lora_adapter.is_some(),
+                        spec_label
                     )),
                 }
             })

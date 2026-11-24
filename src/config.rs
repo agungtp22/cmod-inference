@@ -83,6 +83,12 @@ pub struct BackendConfig {
     pub lora_scale: f32,
     /// Force non-thinking mode by default unless overridden per request (`--no-think`)
     pub default_non_thinking: bool,
+    /// Enable native same-model Multi-Token Prediction (MTP) speculative decoding (`--mtp`)
+    pub enable_mtp: bool,
+    /// Optional external draft GGUF model path for speculative decoding (`--draft-model`)
+    pub draft_model_path: String,
+    /// Maximum number of draft tokens proposed per speculative step (`--draft-max`, default: 4)
+    pub draft_max: u32,
     pub gpu_layers: i32,
     pub kv_cache_quant: String,
     pub kv_cache_ram_mb: u64,
@@ -119,6 +125,9 @@ impl Default for BackendConfig {
             lora_path: String::new(),
             lora_scale: 1.0,
             default_non_thinking: false,
+            enable_mtp: false,
+            draft_model_path: String::new(),
+            draft_max: 4,
             gpu_layers: -1,
             kv_cache_quant: "q8_0".to_string(),
             kv_cache_ram_mb: 2048,

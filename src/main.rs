@@ -111,6 +111,18 @@ TIPS:
         #[arg(long)]
         no_think: bool,
 
+        /// Aktifkan same-model Multi-Token Prediction (MTP) speculative decoding (Gemma 4 / DeepSeek / Qwen3.5)
+        #[arg(long)]
+        mtp: bool,
+
+        /// Path file draft model .gguf untuk speculative decoding (mis. Qwen3-0.6B / Gemma-4-E2B / assistant)
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
+
+        /// Jumlah maksimal token draft per langkah speculative decoding (1-16, default: 4)
+        #[arg(long)]
+        draft_max: Option<u32>,
+
         /// Panjang context window maksimal dalam token (default: 32768, min: 1024)
         #[arg(long)]
         ctx: Option<u32>,
@@ -319,6 +331,9 @@ async fn main() -> Result<()> {
             mmproj,
             lora,
             no_think,
+            mtp,
+            draft_model,
+            draft_max,
             ctx,
             slots,
             gpu_layers,
@@ -411,6 +426,15 @@ async fn main() -> Result<()> {
             }
             if no_think {
                 cfg.backend.default_non_thinking = true;
+            }
+            if mtp {
+                cfg.backend.enable_mtp = true;
+            }
+            if let Some(dm) = draft_model {
+                cfg.backend.draft_model_path = dm.display().to_string();
+            }
+            if let Some(dmax) = draft_max {
+                cfg.backend.draft_max = dmax.clamp(1, 16);
             }
             if let Some(c) = ctx {
                 cfg.backend.max_model_len = c;
