@@ -1,0 +1,846 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>cmod-inference · Local AI Studio</title>
+  <style>
+    :root {
+      --bg-light: #f6f7f9;
+      --bg-dark: #0e1116;
+      --surface-light: #ffffff;
+      --surface-dark: #161b22;
+      --surface-2-light: #eef1f5;
+      --surface-2-dark: #1f2630;
+      --border-light: #d8dee6;
+      --border-dark: #2c3543;
+      --text-light: #141923;
+      --text-dark: #e6edf3;
+      --muted-light: #596577;
+      --muted-dark: #8b97a8;
+      --brand-light: #2563eb;
+      --brand-dark: #60a5fa;
+      --brand-text-light: #ffffff;
+      --brand-text-dark: #081226;
+      --ok-light: #15803d;
+      --ok-dark: #4ade80;
+      --warn-light: #b45309;
+      --warn-dark: #fbbf24;
+      --danger-light: #b91c1c;
+      --danger-dark: #f87171;
+      --scroll-track-light: #e5e9f0;
+      --scroll-track-dark: #161b22;
+      --scroll-thumb-light: #8f9bad;
+      --scroll-thumb-dark: #4b5668;
+
+      --bg: var(--bg-light);
+      --surface: var(--surface-light);
+      --surface-2: var(--surface-2-light);
+      --border: var(--border-light);
+      --text: var(--text-light);
+      --muted: var(--muted-light);
+      --brand: var(--brand-light);
+      --brand-text: var(--brand-text-light);
+      --ok: var(--ok-light);
+      --warn: var(--warn-light);
+      --danger: var(--danger-light);
+      --scroll-track: var(--scroll-track-light);
+      --scroll-thumb: var(--scroll-thumb-light);
+
+      color-scheme: light dark;
+      accent-color: var(--brand);
+      scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: var(--bg-dark);
+        --surface: var(--surface-dark);
+        --surface-2: var(--surface-2-dark);
+        --border: var(--border-dark);
+        --text: var(--text-dark);
+        --muted: var(--muted-dark);
+        --brand: var(--brand-dark);
+        --brand-text: var(--brand-text-dark);
+        --ok: var(--ok-dark);
+        --warn: var(--warn-dark);
+        --danger: var(--danger-dark);
+        --scroll-track: var(--scroll-track-dark);
+        --scroll-thumb: var(--scroll-thumb-dark);
+      }
+    }
+
+    @supports (color: light-dark(white, black)) {
+      :root {
+        --bg: light-dark(var(--bg-light), var(--bg-dark));
+        --surface: light-dark(var(--surface-light), var(--surface-dark));
+        --surface-2: light-dark(var(--surface-2-light), var(--surface-2-dark));
+        --border: light-dark(var(--border-light), var(--border-dark));
+        --text: light-dark(var(--text-light), var(--text-dark));
+        --muted: light-dark(var(--muted-light), var(--muted-dark));
+        --brand: light-dark(var(--brand-light), var(--brand-dark));
+        --brand-text: light-dark(var(--brand-text-light), var(--brand-text-dark));
+        --ok: light-dark(var(--ok-light), var(--ok-dark));
+        --warn: light-dark(var(--warn-light), var(--warn-dark));
+        --danger: light-dark(var(--danger-light), var(--danger-dark));
+        --scroll-track: light-dark(var(--scroll-track-light), var(--scroll-track-dark));
+        --scroll-thumb: light-dark(var(--scroll-thumb-light), var(--scroll-thumb-dark));
+      }
+    }
+
+    @supports not (scrollbar-color: auto) {
+      *::-webkit-scrollbar { width: 10px; height: 10px; }
+      *::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; }
+      *::-webkit-scrollbar-track { background: var(--scroll-track); }
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+
+    .app { display: grid; grid-template-rows: 56px 1fr; height: 100%; }
+    header {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); display: inline-block; }
+    .dot.offline { background: var(--danger); }
+    .pill {
+      font-size: 12px; padding: 3px 9px; border-radius: 999px;
+      background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+    }
+    nav { display: flex; gap: 6px; }
+    nav button {
+      border: 1px solid transparent; background: transparent; color: var(--muted);
+      padding: 7px 13px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px;
+    }
+    nav button.active { background: var(--surface-2); color: var(--text); border-color: var(--border); }
+    nav button:hover { color: var(--text); }
+
+    main { overflow: hidden; height: 100%; }
+    .view { display: none; height: 100%; }
+    .view.active { display: flex; }
+
+    /* Chat View */
+    .chat-layout { display: grid; grid-template-columns: 1fr 290px; width: 100%; height: 100%; }
+    @media (max-width: 900px) { .chat-layout { grid-template-columns: 1fr; } .chat-sidebar { display: none; } }
+    .chat-main { display: grid; grid-template-rows: 1fr auto; height: 100%; overflow: hidden; }
+    .messages { overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
+    .empty-state { margin: auto; text-align: center; max-width: 520px; color: var(--muted); }
+    .empty-state h2 { color: var(--text); margin: 0 0 8px; font-size: 20px; }
+    .msg { display: flex; flex-direction: column; gap: 6px; max-width: 860px; width: 100%; margin: 0 auto; }
+    .msg.user { align-items: flex-end; }
+    .msg .bubble {
+      padding: 12px 16px; border-radius: 12px; line-height: 1.55; font-size: 14px;
+      border: 1px solid var(--border); background: var(--surface); white-space: pre-wrap; word-break: break-word;
+    }
+    .msg.user .bubble { background: var(--brand); color: var(--brand-text); border-color: transparent; max-width: 78%; }
+    .msg.assistant .bubble { width: 100%; }
+    .msg-meta { font-size: 11px; color: var(--muted); display: flex; gap: 12px; padding: 0 4px; }
+    details.think-box {
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 12px; margin-bottom: 10px; font-size: 12.5px; color: var(--muted);
+    }
+    details.think-box summary { cursor: pointer; font-weight: 600; color: var(--text); }
+    details.think-box pre { margin: 8px 0 0; white-space: pre-wrap; font-size: 12px; }
+    .code-wrap { position: relative; margin: 10px 0; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+    .code-head {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 5px 10px; background: var(--surface-2); font-size: 11px; color: var(--muted);
+    }
+    .code-wrap pre { margin: 0; padding: 12px; overflow-x: auto; font-size: 12.5px; background: var(--bg); color: var(--text); }
+    .btn-mini {
+      border: 1px solid var(--border); background: var(--surface); color: var(--text);
+      padding: 3px 8px; border-radius: 6px; font-size: 11px; cursor: pointer;
+    }
+
+    .composer {
+      padding: 14px 24px 18px; border-top: 1px solid var(--border); background: var(--surface);
+    }
+    .composer-inner { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+    .composer textarea {
+      flex: 1; resize: none; min-height: 44px; max-height: 180px; padding: 10px 12px;
+      border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+      font: inherit; font-size: 14px; line-height: 1.45;
+    }
+    .btn {
+      border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+      padding: 9px 14px; border-radius: 9px; font-weight: 600; font-size: 13px; cursor: pointer;
+    }
+    .btn.primary { background: var(--brand); color: var(--brand-text); border-color: transparent; }
+    .btn.danger { background: var(--danger); color: #fff; border-color: transparent; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .chat-sidebar {
+      border-left: 1px solid var(--border); background: var(--surface);
+      padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
+    }
+    .field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
+    .field label { color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
+    .field input[type="text"], .field input[type="password"], .field select, .field textarea {
+      padding: 7px 9px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); font: inherit; font-size: 12.5px;
+    }
+    .row-toggle { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
+
+    /* Monitor & Models Views */
+    .scroll-view { width: 100%; overflow-y: auto; padding: 22px 26px; }
+    .container { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .card .k { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .card .v { font-size: 22px; font-weight: 700; }
+    .card .sub { font-size: 12px; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .badge {
+      display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--surface-2); margin: 2px 4px 2px 0;
+    }
+    .badge.ok { color: var(--ok); border-color: var(--ok); }
+    .badge.warn { color: var(--warn); border-color: var(--warn); }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    pre.snippet {
+      margin: 0; padding: 12px; border-radius: 8px; background: var(--bg);
+      border: 1px solid var(--border); overflow-x: auto; font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <span id="status-dot" class="dot"></span>
+      <span>cmod-inference</span>
+      <span id="active-model-pill" class="pill">loading...</span>
+      <span id="live-tps-pill" class="pill">idle</span>
+    </div>
+    <nav>
+      <button class="active" data-tab="chat">Chat</button>
+      <button data-tab="monitor">Monitor</button>
+      <button data-tab="models">Models</button>
+      <button data-tab="setup">Setup</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- CHAT TAB -->
+    <section id="tab-chat" class="view active">
+      <div class="chat-layout">
+        <div class="chat-main">
+          <div id="messages" class="messages">
+            <div class="empty-state">
+              <h2>Local AI Chat Playground</h2>
+              <p>Streaming chat directly against your in-process <code>cmod-inference</code> engine with live TPS, TTFT, 3-Tier KV-Cache reuse, and collapsible thinking blocks.</p>
+            </div>
+          </div>
+          <div class="composer">
+            <div class="composer-inner">
+              <textarea id="prompt-input" rows="1" placeholder="Ask anything... (Enter to send, Shift+Enter for newline)"></textarea>
+              <button id="send-btn" class="btn primary">Send</button>
+              <button id="stop-btn" class="btn danger" style="display:none">Stop</button>
+            </div>
+          </div>
+        </div>
+
+        <aside class="chat-sidebar">
+          <div class="field">
+            <label for="model-input">Model ID</label>
+            <input id="model-input" type="text" value="">
+          </div>
+          <div class="field">
+            <label for="sys-input">System Prompt</label>
+            <textarea id="sys-input" rows="4" placeholder="Optional system instructions...">You are a concise, helpful engineering assistant.</textarea>
+          </div>
+          <div class="field">
+            <label for="temp-input">Temperature <span id="temp-val">0.2</span></label>
+            <input id="temp-input" type="range" min="0" max="1.5" step="0.05" value="0.2">
+          </div>
+          <div class="field">
+            <label for="max-tok-input">Max Tokens <span id="max-tok-val">1024</span></label>
+            <input id="max-tok-input" type="range" min="128" max="4096" step="128" value="1024">
+          </div>
+          <div class="row-toggle">
+            <label for="think-toggle">Enable Thinking</label>
+            <input id="think-toggle" type="checkbox">
+          </div>
+          <div class="field">
+            <label for="lane-select">Priority Lane</label>
+            <select id="lane-select">
+              <option value="interactive" selected>interactive</option>
+              <option value="batch">batch</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="api-key-input">API Key (if auth enabled)</label>
+            <input id="api-key-input" type="password" placeholder="Optional Bearer token">
+          </div>
+          <button id="clear-btn" class="btn">Clear Conversation</button>
+        </aside>
+      </div>
+    </section>
+
+    <!-- MONITOR TAB -->
+    <section id="tab-monitor" class="view">
+      <div class="scroll-view">
+        <div class="container">
+          <div class="grid-4" id="monitor-cards"></div>
+          <div class="card">
+            <div class="k">Engine Detail</div>
+            <pre id="engine-detail" class="snippet">Loading...</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MODELS TAB -->
+    <section id="tab-models" class="view">
+      <div class="scroll-view">
+        <div class="container">
+          <div class="card">
+            <div class="k">Local Downloaded Models (.gguf)</div>
+            <table>
+              <thead><tr><th>Filename</th><th>Size</th><th>Serve Command</th></tr></thead>
+              <tbody id="local-models-body"><tr><td colspan="3">Loading...</td></tr></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="toolbar" style="justify-content:space-between">
+              <div class="k">Hardware-Recommended Catalog (2025–2026)</div>
+              <div class="toolbar">
+                <button class="btn-mini" data-filter="all">All</button>
+                <button class="btn-mini" data-filter="recommended">Recommended</button>
+                <button class="btn-mini" data-filter="installed">Installed</button>
+              </div>
+            </div>
+            <table>
+              <thead><tr><th>Model</th><th>Status & Tags</th><th>Size</th><th>Action</th></tr></thead>
+              <tbody id="rec-models-body"><tr><td colspan="4">Loading...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SETUP TAB -->
+    <section id="tab-setup" class="view">
+      <div class="scroll-view">
+        <div class="container">
+          <div class="card">
+            <div class="toolbar" style="justify-content:space-between">
+              <div class="k">Zed Editor (~/.config/zed/settings.json)</div>
+              <button class="btn-mini" data-copy="snippet-zed">Copy</button>
+            </div>
+            <pre id="snippet-zed" class="snippet"></pre>
+          </div>
+          <div class="card">
+            <div class="toolbar" style="justify-content:space-between">
+              <div class="k">Claude Code (Anthropic Messages API)</div>
+              <button class="btn-mini" data-copy="snippet-claude">Copy</button>
+            </div>
+            <pre id="snippet-claude" class="snippet"></pre>
+          </div>
+          <div class="card">
+            <div class="toolbar" style="justify-content:space-between">
+              <div class="k">cURL Streaming Example</div>
+              <button class="btn-mini" data-copy="snippet-curl">Copy</button>
+            </div>
+            <pre id="snippet-curl" class="snippet"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const state = {
+  messages: [],
+  activeModel: '',
+  maxModelLen: 32768,
+  abortCtrl: null,
+  recFilter: 'all',
+  recCache: [],
+};
+
+const $ = (id) => document.getElementById(id);
+
+// Tabs
+document.querySelectorAll('nav button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach((b) => b.classList.remove('active'));
+    document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'models') loadModels();
+    if (btn.dataset.tab === 'setup') renderSnippets();
+  });
+});
+
+// Copy buttons
+document.querySelectorAll('[data-copy]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const text = $(btn.dataset.copy).textContent;
+    await navigator.clipboard.writeText(text);
+    const old = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => (btn.textContent = old), 1200);
+  });
+});
+
+// Sliders
+$('temp-input').addEventListener('input', (e) => ($('temp-val').textContent = e.target.value));
+$('max-tok-input').addEventListener('input', (e) => ($('max-tok-val').textContent = e.target.value));
+$('clear-btn').addEventListener('click', () => {
+  state.messages = [];
+  renderEmpty();
+});
+
+function renderEmpty() {
+  const box = $('messages');
+  box.replaceChildren();
+  const wrap = document.createElement('div');
+  wrap.className = 'empty-state';
+  const h = document.createElement('h2');
+  h.textContent = 'Local AI Chat Playground';
+  const p = document.createElement('p');
+  p.textContent = 'Streaming chat directly against your in-process cmod-inference engine with live TPS, TTFT, and 3-Tier KV-Cache.';
+  wrap.append(h, p);
+  box.append(wrap);
+}
+
+// Safe DOM rendering for assistant text + fenced code blocks (zero untrusted innerHTML)
+function renderFormattedText(container, text) {
+  container.replaceChildren();
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith('```') && part.endsWith('```') && part.length >= 6) {
+      const inner = part.slice(3, -3);
+      const nl = inner.indexOf('\n');
+      const lang = nl > -1 ? inner.slice(0, nl).trim() : 'code';
+      const code = nl > -1 ? inner.slice(nl + 1) : inner;
+      const wrap = document.createElement('div');
+      wrap.className = 'code-wrap';
+      const head = document.createElement('div');
+      head.className = 'code-head';
+      const lbl = document.createElement('span');
+      lbl.textContent = lang || 'code';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn-mini';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(code);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => (copyBtn.textContent = 'Copy'), 1200);
+      });
+      head.append(lbl, copyBtn);
+      const pre = document.createElement('pre');
+      pre.textContent = code;
+      wrap.append(head, pre);
+      container.append(wrap);
+    } else {
+      const span = document.createElement('span');
+      span.textContent = part;
+      container.append(span);
+    }
+  }
+}
+
+function appendMessage(role, initialText = '') {
+  const box = $('messages');
+  const empty = box.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  const row = document.createElement('div');
+  row.className = 'msg ' + role;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  let thinkDetails = null;
+  let thinkPre = null;
+  const bodyEl = document.createElement('div');
+  if (initialText) renderFormattedText(bodyEl, initialText);
+  bubble.append(bodyEl);
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+  row.append(bubble, meta);
+  box.append(row);
+  box.scrollTop = box.scrollHeight;
+
+  return {
+    setThinking(t) {
+      if (!t) return;
+      if (!thinkDetails) {
+        thinkDetails = document.createElement('details');
+        thinkDetails.className = 'think-box';
+        const sum = document.createElement('summary');
+        sum.textContent = 'Thinking';
+        thinkPre = document.createElement('pre');
+        thinkDetails.append(sum, thinkPre);
+        bubble.prepend(thinkDetails);
+      }
+      thinkPre.textContent = t;
+      box.scrollTop = box.scrollHeight;
+    },
+    setText(t) {
+      renderFormattedText(bodyEl, t);
+      box.scrollTop = box.scrollHeight;
+    },
+    setMeta(text) {
+      meta.textContent = text;
+    },
+  };
+}
+
+async function sendMessage() {
+  const input = $('prompt-input');
+  const text = input.value.trim();
+  if (!text || state.abortCtrl) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  appendMessage('user', text);
+  state.messages.push({ role: 'user', content: text });
+
+  const ui = appendMessage('assistant', '');
+  ui.setMeta('Generating...');
+
+  const sys = $('sys-input').value.trim();
+  const payloadMessages = sys ? [{ role: 'system', content: sys }, ...state.messages] : [...state.messages];
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Cmod-Priority': $('lane-select').value,
+  };
+  const key = $('api-key-input').value.trim();
+  if (key) headers['Authorization'] = 'Bearer ' + key;
+
+  state.abortCtrl = new AbortController();
+  $('send-btn').style.display = 'none';
+  $('stop-btn').style.display = 'inline-block';
+
+  const t0 = performance.now();
+  let ttft = null;
+  let fullText = '';
+  let fullThink = '';
+  let chunkTokens = 0;
+  let usage = null;
+
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      signal: state.abortCtrl.signal,
+      body: JSON.stringify({
+        model: $('model-input').value.trim() || state.activeModel,
+        messages: payloadMessages,
+        stream: true,
+        temperature: parseFloat($('temp-input').value),
+        max_tokens: parseInt($('max-tok-input').value, 10),
+        enable_thinking: $('think-toggle').checked,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      ui.setText('Error ' + res.status + ': ' + errText);
+      ui.setMeta('Failed');
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.usage) usage = parsed.usage;
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) continue;
+          if (delta.reasoning_content) {
+            if (ttft === null) ttft = performance.now() - t0;
+            fullThink += delta.reasoning_content;
+            chunkTokens++;
+            ui.setThinking(fullThink);
+          }
+          if (delta.content) {
+            if (ttft === null) ttft = performance.now() - t0;
+            fullText += delta.content;
+            chunkTokens++;
+            ui.setText(fullText);
+          }
+          const elapsedSec = Math.max((performance.now() - t0) / 1000, 0.05);
+          const liveTps = (chunkTokens / elapsedSec).toFixed(1);
+          $('live-tps-pill').textContent = liveTps + ' tok/s';
+          ui.setMeta('Streaming · ' + liveTps + ' tok/s');
+        } catch (_) {}
+      }
+    }
+
+    const totalSec = Math.max((performance.now() - t0) / 1000, 0.01);
+    const outTok = usage?.completion_tokens ?? chunkTokens;
+    const inTok = usage?.prompt_tokens ?? 0;
+    const cachedTok = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    const finalTps = (outTok / totalSec).toFixed(1);
+    $('live-tps-pill').textContent = finalTps + ' tok/s';
+    ui.setMeta(
+      `TTFT ${ttft ? Math.round(ttft) : 0}ms · ${finalTps} tok/s · in ${inTok} (cached ${cachedTok}) · out ${outTok}`
+    );
+    if (fullText) state.messages.push({ role: 'assistant', content: fullText });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      ui.setMeta('Stopped by user');
+      if (fullText) state.messages.push({ role: 'assistant', content: fullText });
+    } else {
+      ui.setText('Request failed: ' + err.message);
+      ui.setMeta('Error');
+    }
+  } finally {
+    state.abortCtrl = null;
+    $('send-btn').style.display = 'inline-block';
+    $('stop-btn').style.display = 'none';
+  }
+}
+
+$('send-btn').addEventListener('click', sendMessage);
+$('stop-btn').addEventListener('click', () => state.abortCtrl?.abort());
+$('prompt-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// Live status polling
+async function pollStatus() {
+  try {
+    const res = await fetch('/cmod/v1/status');
+    const s = await res.json();
+    $('status-dot').className = 'dot' + (s.backend?.ready ? '' : ' offline');
+    state.activeModel = s.backend?.model || 'unknown';
+    state.maxModelLen = s.maxModelLen || 32768;
+    $('active-model-pill').textContent = `${state.activeModel} (${s.backend?.kind || ''})`;
+    if (!$('model-input').value) $('model-input').value = state.activeModel;
+
+    const kv = s.kvCache || {};
+    const sc = s.scheduler || {};
+    const hw = s.hardware || {};
+    const hits = (kv.l1VramHits || 0) + (kv.l2RamHits || 0) + (kv.l3DiskHits || 0);
+    const totalLookups = hits + (kv.misses || 0);
+    const hitPct = totalLookups > 0 ? Math.round((hits / totalLookups) * 100) : 0;
+
+    const cards = [
+      ['Active Model', state.activeModel, `${s.backend?.kind || ''} · ctx ${s.maxModelLen} · kv ${s.kvCacheQuant}`],
+      ['Scheduler', `${sc.interactiveActive || 0}/${sc.interactiveSlots || 0} active`, `batch ${sc.batchActive || 0}/${sc.batchSlots || 0} · done ${sc.totalCompleted || 0}`],
+      ['3-Tier KV-Cache', `${hitPct}% hit rate`, `L1 ${kv.l1VramHits || 0} · L2 ${kv.l2RamHits || 0} (${Math.round((kv.l2RamUsedBytes || 0)/1048576)}MB) · L3 ${kv.l3DiskHits || 0}`],
+      ['Hardware VRAM', `${hw.usableVramMb || 0} MB`, `recommended: ${hw.recommendedBackend || ''}`],
+    ];
+    const grid = $('monitor-cards');
+    grid.replaceChildren();
+    for (const [k, v, sub] of cards) {
+      const c = document.createElement('div');
+      c.className = 'card';
+      const ek = document.createElement('div'); ek.className = 'k'; ek.textContent = k;
+      const ev = document.createElement('div'); ev.className = 'v'; ev.textContent = v;
+      const es = document.createElement('div'); es.className = 'sub'; es.textContent = sub;
+      c.append(ek, ev, es);
+      grid.append(c);
+    }
+    $('engine-detail').textContent = JSON.stringify(s, null, 2);
+  } catch (_) {
+    $('status-dot').className = 'dot offline';
+  }
+}
+
+async function loadModels() {
+  try {
+    const [locRes, recRes] = await Promise.all([
+      fetch('/cmod/v1/models/local'),
+      fetch('/cmod/v1/models/recommend'),
+    ]);
+    const loc = await locRes.json();
+    const rec = await recRes.json();
+
+    const lb = $('local-models-body');
+    lb.replaceChildren();
+    if (!loc.models?.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 3;
+      td.textContent = 'No .gguf models found in ' + (loc.modelsDir || './models');
+      tr.append(td);
+      lb.append(tr);
+    } else {
+      for (const m of loc.models) {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td'); td1.textContent = m.filename;
+        const td2 = document.createElement('td'); td2.textContent = (m.sizeMb / 1024).toFixed(2) + ' GB';
+        const td3 = document.createElement('td');
+        const cmd = `cmod serve --backend native --model-path "${m.path}" --ctx 32768 --slots 1`;
+        const btn = document.createElement('button');
+        btn.className = 'btn-mini';
+        btn.textContent = 'Copy Serve Cmd';
+        btn.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(cmd);
+          btn.textContent = 'Copied!';
+          setTimeout(() => (btn.textContent = 'Copy Serve Cmd'), 1200);
+        });
+        td3.append(btn);
+        tr.append(td1, td2, td3);
+        lb.append(tr);
+      }
+    }
+
+    state.recCache = rec.recommendations || [];
+    renderRecModels();
+  } catch (_) {}
+}
+
+document.querySelectorAll('[data-filter]').forEach((b) => {
+  b.addEventListener('click', () => {
+    state.recFilter = b.dataset.filter;
+    renderRecModels();
+  });
+});
+
+function renderRecModels() {
+  const rb = $('rec-models-body');
+  rb.replaceChildren();
+  const list = state.recCache.filter((r) => {
+    if (state.recFilter === 'recommended') return r.status === 'recommended';
+    if (state.recFilter === 'installed') return r.installed;
+    return true;
+  });
+  for (const r of list) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    const strong = document.createElement('strong'); strong.textContent = r.model.name;
+    const br = document.createElement('br');
+    const small = document.createElement('span'); small.style.color = 'var(--muted)'; small.textContent = r.model.bestFor || r.model.best_for || '';
+    td1.append(strong, br, small);
+
+    const td2 = document.createElement('td');
+    const st = document.createElement('span');
+    st.className = 'badge ' + (r.status === 'recommended' ? 'ok' : r.status === 'compatible' ? '' : 'warn');
+    st.textContent = r.status;
+    td2.append(st);
+    for (const tag of (r.tags || []).slice(0, 4)) {
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.textContent = tag;
+      td2.append(b);
+    }
+
+    const td3 = document.createElement('td');
+    td3.textContent = ((r.model.diskMb || r.model.disk_mb || 0) / 1024).toFixed(1) + ' GB';
+
+    const td4 = document.createElement('td');
+    if (r.installed) {
+      const ok = document.createElement('span'); ok.className = 'badge ok'; ok.textContent = 'Installed';
+      td4.append(ok);
+    } else {
+      const btn = document.createElement('button');
+      btn.className = 'btn-mini';
+      btn.textContent = 'Download';
+      btn.addEventListener('click', () => startDownload(r.model.id, btn));
+      td4.append(btn);
+    }
+    tr.append(td1, td2, td3, td4);
+    rb.append(tr);
+  }
+}
+
+async function startDownload(id, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  const headers = { 'Content-Type': 'application/json' };
+  const key = $('api-key-input').value.trim();
+  if (key) headers['Authorization'] = 'Bearer ' + key;
+  try {
+    const res = await fetch('/cmod/v1/models/pull', {
+      method: 'POST', headers, body: JSON.stringify({ id }),
+    });
+    if (!res.ok) {
+      btn.textContent = 'Error ' + res.status;
+      btn.disabled = false;
+      return;
+    }
+    const timer = setInterval(async () => {
+      const pr = await fetch('/cmod/v1/models/pull/' + encodeURIComponent(id));
+      if (!pr.ok) return;
+      const p = await pr.json();
+      const pct = p.totalBytes > 0 ? Math.round((p.downloadedBytes / p.totalBytes) * 100) : 0;
+      if (p.status === 'completed') {
+        clearInterval(timer);
+        btn.textContent = 'Installed';
+        loadModels();
+      } else if (p.status === 'failed') {
+        clearInterval(timer);
+        btn.textContent = 'Failed';
+        btn.disabled = false;
+      } else {
+        btn.textContent = pct + '%';
+      }
+    }, 1500);
+  } catch (_) {
+    btn.textContent = 'Failed';
+    btn.disabled = false;
+  }
+}
+
+function renderSnippets() {
+  const origin = window.location.origin;
+  const m = state.activeModel || 'ministral-3-14b-q4km';
+  $('snippet-zed').textContent = JSON.stringify({
+    language_models: {
+      openai_compatible: {
+        cmod: {
+          api_url: origin + '/v1',
+          available_models: [{
+            name: m,
+            display_name: m + ' (cmod-inference)',
+            max_tokens: state.maxModelLen,
+            max_output_tokens: 4096,
+            max_completion_tokens: 4096,
+            capabilities: { tools: true, images: false, chat_completions: true }
+          }]
+        }
+      }
+    }
+  }, null, 2);
+
+  $('snippet-claude').textContent =
+`ANTHROPIC_BASE_URL=${origin} \\
+ANTHROPIC_AUTH_TOKEN=local-dev \\
+ANTHROPIC_MODEL=${m} \\
+claude`;
+
+  $('snippet-curl').textContent =
+`curl -N ${origin}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${m}","stream":true,"temperature":0.2,"messages":[{"role":"user","content":"Hello!"}]}'`;
+}
+
+pollStatus();
+setInterval(pollStatus, 2500);
+</script>
+</body>
+</html>

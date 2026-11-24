@@ -9,6 +9,7 @@ pub mod models;
 pub mod presets;
 pub mod protocol;
 pub mod scheduler;
+pub mod ui;
 
 use std::sync::Arc;
 
@@ -36,6 +37,8 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        // Built-in Web GUI (Chat Playground + Live Monitor + Model Manager + Setup)
+        .route("/", get(ui::index))
         // OpenAI-compatible API
         .route("/v1/chat/completions", post(protocol::openai::chat_completions))
         .route("/v1/embeddings", post(protocol::openai::embeddings))

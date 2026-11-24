@@ -641,6 +641,7 @@ mod imp {
         req: CanonicalRequest,
         tx: mpsc::UnboundedSender<Result<CanonicalStreamEvent>>,
     ) -> Result<()> {
+        let req_started = std::time::Instant::now();
         let forced_tool_schema = if cfg!(feature = "grammar")
             && matches!(req.response_format, ResponseFormat::Text)
         {
@@ -847,6 +848,8 @@ mod imp {
             last_logit_idx = batch.n_tokens() - 1;
         }
 
+        let prefill_ms = req_started.elapsed().as_millis();
+        let decode_started = std::time::Instant::now();
         let mut sampler = build_sampler(inner, &req, forced_tool_schema.as_ref());
         let mut parser = NativeOutputParser::new();
         let mut output_count: u64 = 0;
@@ -972,6 +975,18 @@ mod imp {
                 }
             }
         }
+
+        let decode_secs = decode_started.elapsed().as_secs_f64().max(0.001);
+        let decode_tps = output_count as f64 / decode_secs;
+        info!(
+            model = %inner.model_id,
+            in_tok = input_count,
+            cached_tok = cached_prefix_tokens,
+            out_tok = output_count,
+            prefill_ms,
+            decode_tps = format!("{decode_tps:.1}"),
+            "Request selesai"
+        );
 
         let _ = tx.send(Ok(CanonicalStreamEvent::Usage(UsageStats {
             input_tokens: input_count,
