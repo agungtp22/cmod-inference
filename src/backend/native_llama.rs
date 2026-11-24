@@ -934,7 +934,7 @@ mod imp {
         let mut add_bos = !prompt.starts_with("<s>");
         let mut prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
         let max_ctx_usize = inner.max_model_len as usize;
-        let safe_prompt_limit = max_ctx_usize.saturating_sub(512).max(256);
+        let safe_prompt_limit = max_ctx_usize.saturating_sub(2048).max(max_ctx_usize / 2);
 
         // Exact-tokenizer auto-compacting: if actual token count exceeds the safe budget
         // (even after the fast chars/4 pre-check), prune old tool results and slide-compact

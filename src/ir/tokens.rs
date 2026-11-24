@@ -84,8 +84,31 @@ pub fn auto_prune_old_tool_results(req: &mut CanonicalRequest, max_model_len: u3
             }
         }
         if estimate_request_input_tokens(req) + requested_output <= limit {
-            break;
+            return pruned;
         }
+    }
+
+    // Stage 2: if still over the context window budget (e.g. long multi-turn chat),
+    // drop oldest turns outside the last 4 messages so check_context_window doesn't 400.
+    let target_input_budget = limit.saturating_sub(2048).max(limit / 2);
+    let mut dropped_turns = 0usize;
+    while estimate_request_input_tokens(req) > target_input_budget && req.messages.len() > 4 {
+        req.messages.remove(0);
+        dropped_turns += 1;
+    }
+    if dropped_turns > 0 {
+        req.messages.insert(
+            0,
+            crate::ir::CanonicalMessage {
+                role: crate::ir::Role::User,
+                parts: vec![ContentPart::Text {
+                    text: format!(
+                        "[Auto-compacted {dropped_turns} earlier messages to stay within {limit} token context window.]"
+                    ),
+                }],
+            },
+        );
+        pruned += dropped_turns;
     }
     pruned
 }
