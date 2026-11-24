@@ -406,7 +406,7 @@ pub async fn messages(
         );
     }
 
-    let estimated_input = match check_context_window(&canonical, state.config.backend.max_model_len)
+    let estimated_input = match check_context_window(&mut canonical, state.config.backend.max_model_len)
     {
         Ok(n) => n,
         Err(msg) => {

@@ -457,7 +457,7 @@ pub async fn chat_completions(
         );
     }
 
-    if let Err(msg) = check_context_window(&canonical, state.config.backend.max_model_len) {
+    if let Err(msg) = check_context_window(&mut canonical, state.config.backend.max_model_len) {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",

@@ -91,22 +91,24 @@ pub fn auto_prune_old_tool_results(req: &mut CanonicalRequest, max_model_len: u3
 }
 
 /// Guard against silent context truncation on long documents.
-pub fn check_context_window(req: &CanonicalRequest, max_model_len: u32) -> Result<u64, String> {
+/// If `input_tokens` fits within `max_model_len` with room for at least 128 output tokens
+/// but `input_tokens + requested_output > max_model_len`, automatically clamps `max_tokens`
+/// to the remaining headroom (matching llama-server/Ollama behavior) instead of failing with 400.
+pub fn check_context_window(req: &mut CanonicalRequest, max_model_len: u32) -> Result<u64, String> {
     let input_tokens = estimate_request_input_tokens(req);
-    let requested_output = u64::from(req.sampling.max_tokens.unwrap_or(1024));
     let limit = u64::from(max_model_len);
 
-    if input_tokens >= limit {
+    if input_tokens + 128 >= limit {
         return Err(format!(
             "context_length_exceeded: estimasi input {input_tokens} token melampaui batas server max_model_len={limit}. \
              Aktifkan retrieval/chunking atau naikkan max_model_len."
         ));
     }
-    if input_tokens + requested_output > limit {
-        return Err(format!(
-            "context_length_exceeded: estimasi input ({input_tokens}) + max_tokens ({requested_output}) = {} melebihi max_model_len={limit}.",
-            input_tokens + requested_output
-        ));
+    let remaining = (limit - input_tokens) as u32;
+    if let Some(requested) = req.sampling.max_tokens {
+        if requested > remaining {
+            req.sampling.max_tokens = Some(remaining);
+        }
     }
     Ok(input_tokens)
 }
@@ -171,10 +173,10 @@ mod tests {
         };
 
         // Limit 2048: fails before prune, succeeds after pruning old tool_results
-        assert!(check_context_window(&req, 2048).is_err());
+        assert!(check_context_window(&mut req, 2048).is_err());
         let pruned = auto_prune_old_tool_results(&mut req, 2048);
         assert_eq!(pruned, 2);
-        assert!(check_context_window(&req, 2048).is_ok());
+        assert!(check_context_window(&mut req, 2048).is_ok());
 
         // Recent tool result (index 7, inside last 6 messages) must remain untouched
         if let ContentPart::ToolResult { content, .. } = &req.messages[7].parts[0] {
