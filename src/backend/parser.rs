@@ -8,6 +8,7 @@ const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
 const FUNC_OPEN: &str = "<function=";
 const FUNC_CLOSE: &str = "</function>";
+const MISTRAL_TOOLS_OPEN: &str = "[TOOL_CALLS]";
 
 /// Format tool definitions into a deterministic system prompt block for native GGUF models
 /// (compatible with Qwen / Hermes / Llama / Gemma instruction-tuned models).
@@ -68,6 +69,7 @@ enum ParseState {
     InThink,
     InToolCall,
     InFuncCall,
+    InMistralTools,
 }
 
 /// Incremental streaming parser that separates `<think>...</think>` into `ThinkingDelta`,
@@ -103,12 +105,14 @@ impl NativeOutputParser {
                     let next_think = self.buf.find(THINK_OPEN);
                     let next_tool = self.buf.find(TOOL_OPEN);
                     let next_func = self.buf.find(FUNC_OPEN);
+                    let next_mistral = self.buf.find(MISTRAL_TOOLS_OPEN);
 
-                    // Pick earliest opening tag among <think>, <tool_call>, and <function=
+                    // Pick earliest opening tag among <think>, <tool_call>, <function=, and [TOOL_CALLS]
                     let earliest = [
                         next_think.map(|i| (i, 0u8)),
                         next_tool.map(|i| (i, 1u8)),
                         next_func.map(|i| (i, 2u8)),
+                        next_mistral.map(|i| (i, 3u8)),
                     ]
                     .into_iter()
                     .flatten()
@@ -141,9 +145,20 @@ impl NativeOutputParser {
                             self.tool_buf.clear();
                             self.state = ParseState::InFuncCall;
                         }
+                        Some((mi, 3)) => {
+                            let before = self.buf[..mi].to_string();
+                            self.buf.drain(..mi + MISTRAL_TOOLS_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InMistralTools;
+                        }
                         _ => {
-                            let keep =
-                                longest_tag_prefix(&self.buf, &[THINK_OPEN, TOOL_OPEN, FUNC_OPEN]);
+                            let keep = longest_tag_prefix(
+                                &self.buf,
+                                &[THINK_OPEN, TOOL_OPEN, FUNC_OPEN, MISTRAL_TOOLS_OPEN],
+                            );
                             let emit_len = self.buf.len().saturating_sub(keep);
                             if emit_len > 0 {
                                 let out = self.buf[..emit_len].to_string();
@@ -205,6 +220,11 @@ impl NativeOutputParser {
                         break;
                     }
                 }
+                ParseState::InMistralTools => {
+                    self.tool_buf.push_str(&self.buf);
+                    self.buf.clear();
+                    break;
+                }
             }
         }
 
@@ -235,6 +255,11 @@ impl NativeOutputParser {
                 self.tool_buf.push_str(&self.buf);
                 self.buf.clear();
                 self.emit_func_call(&mut events);
+            }
+            ParseState::InMistralTools => {
+                self.tool_buf.push_str(&self.buf);
+                self.buf.clear();
+                self.emit_mistral_tools(&mut events);
             }
         }
         events
@@ -315,6 +340,77 @@ impl NativeOutputParser {
         if !raw.is_empty() {
             events.push(CanonicalStreamEvent::TextDelta(format!("<function={raw}")));
         }
+    }
+
+    /// Parse Mistral/Devstral `[TOOL_CALLS] [{"name":"...","arguments":{...}}]` or
+    /// `[TOOL_CALLS] func_name[ARGS]{...}` format.
+    fn emit_mistral_tools(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
+        let raw = self.tool_buf.trim().to_string();
+        self.tool_buf.clear();
+        if raw.is_empty() {
+            return;
+        }
+        // Format A: JSON array `[{"name": "...", "arguments": {...}}]` or single object `{...}`
+        if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+            let items: Vec<&Value> = match &parsed {
+                Value::Array(arr) => arr.iter().collect(),
+                Value::Object(_) => vec![&parsed],
+                _ => Vec::new(),
+            };
+            let mut emitted = false;
+            for item in items {
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args = item
+                        .get("arguments")
+                        .or_else(|| item.get("parameters"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let args_str =
+                        serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    emitted = true;
+                }
+            }
+            if emitted {
+                return;
+            }
+        }
+        // Format B (Mistral v3 / Ministral-3): `func_name[ARGS]{"key":"val"}`
+        if let Some((name_part, args_part)) = raw.split_once("[ARGS]") {
+            let name = name_part.trim();
+            let args_raw = args_part.trim();
+            if !name.is_empty() {
+                if let Ok(args_val) = serde_json::from_str::<Value>(args_raw) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args_str =
+                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    return;
+                }
+            }
+        }
+        events.push(CanonicalStreamEvent::TextDelta(raw));
     }
 }
 
