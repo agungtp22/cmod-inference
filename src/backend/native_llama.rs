@@ -448,7 +448,7 @@ mod imp {
             let res = if let Some(ref mut mtp) = mtp_ctx {
                 execute_on_context(
                     &inner,
-                    mtp.target_context_mut(),
+                    TargetSlot::Mtp(mtp),
                     None,
                     #[cfg(feature = "multimodal")]
                     mtmd_ctx.as_mut(),
@@ -460,7 +460,7 @@ mod imp {
             } else {
                 execute_on_context(
                     &inner,
-                    plain_ctx.as_mut().unwrap(),
+                    TargetSlot::Plain(plain_ctx.as_mut().unwrap()),
                     ext_draft_ctx.as_mut(),
                     #[cfg(feature = "multimodal")]
                     mtmd_ctx.as_mut(),
@@ -896,9 +896,23 @@ mod imp {
         a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
     }
 
+    enum TargetSlot<'a, 'model> {
+        Plain(&'a mut LlamaContext<'model>),
+        Mtp(&'a mut MtpSpeculative<'model>),
+    }
+
+    impl<'model> TargetSlot<'_, 'model> {
+        fn ctx_mut(&mut self) -> &mut LlamaContext<'model> {
+            match self {
+                Self::Plain(c) => c,
+                Self::Mtp(m) => m.target_context_mut(),
+            }
+        }
+    }
+
     fn execute_on_context(
         inner: &NativeEngineInner,
-        ctx: &mut LlamaContext<'_>,
+        mut slot: TargetSlot<'_, '_>,
         mut draft_ctx_opt: Option<&mut LlamaContext<'_>>,
         #[cfg(feature = "multimodal")] mut mtmd_ctx_opt: Option<&mut llama_cpp_2::mtmd::MtmdContext>,
         l1_tokens: &mut Vec<LlamaToken>,
@@ -919,7 +933,16 @@ mod imp {
         let add_bos = !prompt.starts_with("<s>");
         let prompt_tokens = vocab.tokenize(prompt.as_bytes(), add_bos, true);
         let input_count = prompt_tokens.len() as u64;
-        let max_new = req.sampling.max_tokens.unwrap_or(1024) as usize;
+        let max_ctx_usize = inner.max_model_len as usize;
+        if prompt_tokens.len() + 1 >= max_ctx_usize {
+            return Err(anyhow!(
+                "context_length_exceeded: jumlah token aktual ({}) melampaui batas context server ({}). Mulai thread baru atau naikkan --ctx.",
+                prompt_tokens.len(),
+                inner.max_model_len
+            ));
+        }
+        let available_out = max_ctx_usize.saturating_sub(prompt_tokens.len() + 1).max(1);
+        let max_new = (req.sampling.max_tokens.unwrap_or(1024) as usize).min(available_out);
 
         let _ = tx.send(Ok(CanonicalStreamEvent::Start {
             id: req.request_id.clone(),
@@ -952,7 +975,7 @@ mod imp {
             if let Some(mtmd_ctx) = mtmd_ctx_opt.as_deref_mut() {
                 use base64::Engine;
                 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdInputText};
-                ctx.clear_kv_cache();
+                slot.ctx_mut().clear_kv_cache();
                 *l1_valid = false;
                 l1_tokens.clear();
 
@@ -978,7 +1001,7 @@ mod imp {
                     .map_err(|e| anyhow!("gagal tokenize multimodal mtmd: {e:?}"))?;
 
                 let new_n_past = chunks
-                    .eval_chunks(mtmd_ctx, ctx, 0, 0, batch_cap as i32, true)
+                    .eval_chunks(mtmd_ctx, slot.ctx_mut(), 0, 0, batch_cap as i32, true)
                     .map_err(|e| anyhow!("gagal evaluasi multimodal mtmd: {e:?}"))?;
                 n_cur = new_n_past;
                 last_logit_idx = -1;
@@ -1012,7 +1035,8 @@ mod imp {
                 if matched > 16 && matched < prompt_tokens.len() {
                     let can_reuse = matched == l1_tokens.len()
                         || matches!(
-                            ctx.clear_kv_cache_seq(Some(0), Some(matched as u32), None),
+                            slot.ctx_mut()
+                                .clear_kv_cache_seq(Some(0), Some(matched as u32), None),
                             Ok(true)
                         );
                     if can_reuse {
@@ -1024,15 +1048,15 @@ mod imp {
 
             // Tier 2 (L2 Host RAM) & Tier 3 (L3 NVMe Disk)
             if cached_prefix_tokens == 0 {
-                ctx.clear_kv_cache();
+                slot.ctx_mut().clear_kv_cache();
                 if !req.prefix_hash.is_empty() && prompt_tokens.len() > 16 {
                     if let Some(snap) = inner.kv_cache.get_ram(&cache_key) {
                         let matched = common_prefix_len(&snap.tokens, &prompt_tokens);
                         if matched > 16 && matched < prompt_tokens.len() {
-                            if ctx.state_seq_set(&snap.state, 0).is_ok()
+                            if slot.ctx_mut().state_seq_set(&snap.state, 0).is_ok()
                                 && (matched == snap.tokens.len()
                                     || matches!(
-                                        ctx.clear_kv_cache_seq(
+                                        slot.ctx_mut().clear_kv_cache_seq(
                                             Some(0),
                                             Some(matched as u32),
                                             None
@@ -1043,20 +1067,22 @@ mod imp {
                                 cached_prefix_tokens = matched;
                                 inner.kv_cache.record_l2_hit();
                             } else {
-                                ctx.clear_kv_cache();
+                                slot.ctx_mut().clear_kv_cache();
                             }
                         }
                     } else if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
                         if disk_path.exists() {
-                            if let Ok((disk_tokens, _)) =
-                                ctx.state_seq_load_file(&disk_path, 0, inner.max_model_len as usize)
-                            {
+                            if let Ok((disk_tokens, _)) = slot.ctx_mut().state_seq_load_file(
+                                &disk_path,
+                                0,
+                                inner.max_model_len as usize,
+                            ) {
                                 let matched = common_prefix_len(&disk_tokens, &prompt_tokens);
                                 if matched > 16
                                     && matched < prompt_tokens.len()
                                     && (matched == disk_tokens.len()
                                         || matches!(
-                                            ctx.clear_kv_cache_seq(
+                                            slot.ctx_mut().clear_kv_cache_seq(
                                                 Some(0),
                                                 Some(matched as u32),
                                                 None
@@ -1066,8 +1092,9 @@ mod imp {
                                 {
                                     cached_prefix_tokens = matched;
                                     inner.kv_cache.record_l3_hit();
-                                    if let Ok(state) =
-                                        ctx.state_seq_get(0, LlamaStateSeqFlags::empty())
+                                    if let Ok(state) = slot
+                                        .ctx_mut()
+                                        .state_seq_get(0, LlamaStateSeqFlags::empty())
                                     {
                                         inner.kv_cache.put_ram(
                                             cache_key.clone(),
@@ -1078,7 +1105,7 @@ mod imp {
                                         );
                                     }
                                 } else {
-                                    ctx.clear_kv_cache();
+                                    slot.ctx_mut().clear_kv_cache();
                                 }
                             }
                         }
@@ -1090,15 +1117,43 @@ mod imp {
             }
 
             let total_prompt = prompt_tokens.len();
-            for chunk_start in (cached_prefix_tokens..total_prompt).step_by(batch_cap) {
-                batch.clear();
-                let chunk_end = (chunk_start + batch_cap).min(total_prompt);
-                for (offset, &tok) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
-                    let pos = (chunk_start + offset) as i32;
-                    let is_last = pos as usize == total_prompt - 1;
-                    batch.add(tok, pos, &[0], is_last)?;
+            let mut prefill_start = cached_prefix_tokens;
+            let mut retried_clean = false;
+            loop {
+                let mut prefill_ok = true;
+                for chunk_start in (prefill_start..total_prompt).step_by(batch_cap) {
+                    batch.clear();
+                    let chunk_end = (chunk_start + batch_cap).min(total_prompt);
+                    for (offset, &tok) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
+                        let pos = (chunk_start + offset) as i32;
+                        let is_last = pos as usize == total_prompt - 1;
+                        batch.add(tok, pos, &[0], is_last)?;
+                    }
+                    if let Err(err) = slot.ctx_mut().decode(&mut batch) {
+                        if prefill_start > 0 && !retried_clean {
+                            warn!(
+                                cached = prefill_start,
+                                "Prefill gagal setelah reuse KV-cache ({err}); retry clean prefill dari 0"
+                            );
+                            slot.ctx_mut().clear_kv_cache();
+                            cached_prefix_tokens = 0;
+                            prefill_start = 0;
+                            retried_clean = true;
+                            prefill_ok = false;
+                            break;
+                        }
+                        return Err(err).context("gagal prefill prompt");
+                    }
+                    if let TargetSlot::Mtp(ref mut mtp) = slot {
+                        if chunk_start == prefill_start {
+                            let _ = mtp.begin(&prompt_tokens[..chunk_end]);
+                        }
+                        let _ = mtp.process(&batch);
+                    }
                 }
-                ctx.decode(&mut batch).context("gagal prefill prompt")?;
+                if prefill_ok {
+                    break;
+                }
             }
 
             // Defer L2 RAM & L3 Disk persistence until AFTER response Done is flushed to client
@@ -1135,7 +1190,6 @@ mod imp {
 
         // Prefill external draft model context when speculative decoding is active
         let mut draft_n_cur: i32 = 0;
-        let mut draft_last_idx: i32 = 0;
         let mut draft_batch = LlamaBatch::new(batch_cap, 1);
         let mut draft_sampler = LlamaSampler::greedy();
         let mut spec_drafted: u64 = 0;
@@ -1158,11 +1212,10 @@ mod imp {
                         .context("gagal prefill prompt draft model")?;
                 }
                 draft_n_cur = total_prompt as i32;
-                draft_last_idx = draft_batch.n_tokens() - 1;
             }
         }
 
-        let mut emit_token = |token: LlamaToken,
+        let emit_token = |token: LlamaToken,
                               utf8_buf: &mut Vec<u8>,
                               accumulated: &mut String,
                               parser: &mut NativeOutputParser,
@@ -1207,7 +1260,114 @@ mod imp {
             Some(false)
         };
 
-        if use_ext_draft {
+        let use_mtp_spec = matches!(slot, TargetSlot::Mtp(_))
+            && !is_forced_tool
+            && matches!(req.response_format, ResponseFormat::Text)
+            && raw_images.is_empty();
+
+        if use_mtp_spec {
+            if let TargetSlot::Mtp(ref mut mtp) = slot {
+                let mut hist_tokens = prompt_tokens.clone();
+                let mut cur_token = sampler.sample(mtp.target_context(), last_logit_idx);
+                while !vocab.is_eog(cur_token) {
+                    if *l1_valid {
+                        l1_tokens.push(cur_token);
+                    }
+                    hist_tokens.push(cur_token);
+                    match emit_token(
+                        cur_token,
+                        &mut utf8_buf,
+                        &mut accumulated,
+                        &mut parser,
+                        &mut output_count,
+                        &mut stop_reason,
+                    ) {
+                        None => return Ok(()),
+                        Some(true) => break,
+                        Some(false) => {}
+                    }
+
+                    let drafted = mtp
+                        .draft(n_cur, cur_token, &hist_tokens)
+                        .unwrap_or_default();
+                    spec_drafted += drafted.len() as u64;
+
+                    batch.clear();
+                    let target_base_pos = n_cur;
+                    batch.add(cur_token, n_cur, &[0], true)?;
+                    n_cur += 1;
+                    for &dt in &drafted {
+                        if n_cur as usize >= max_ctx_usize {
+                            break;
+                        }
+                        batch.add(dt, n_cur, &[0], true)?;
+                        n_cur += 1;
+                    }
+                    mtp.target_context_mut()
+                        .decode(&mut batch)
+                        .context("gagal verifikasi batch MTP")?;
+                    let _ = mtp.process(&batch);
+
+                    let mut n_accepted = 0usize;
+                    let mut next_token = sampler.sample(mtp.target_context(), 0);
+                    let mut hit_stop = false;
+
+                    for (i, &dt) in drafted.iter().enumerate() {
+                        if (i + 1) >= batch.n_tokens() as usize {
+                            break;
+                        }
+                        if next_token == dt {
+                            n_accepted += 1;
+                            spec_accepted += 1;
+                            if *l1_valid {
+                                l1_tokens.push(dt);
+                            }
+                            hist_tokens.push(dt);
+                            match emit_token(
+                                dt,
+                                &mut utf8_buf,
+                                &mut accumulated,
+                                &mut parser,
+                                &mut output_count,
+                                &mut stop_reason,
+                            ) {
+                                None => return Ok(()),
+                                Some(true) => {
+                                    hit_stop = true;
+                                    break;
+                                }
+                                Some(false) => {}
+                            }
+                            next_token = sampler.sample(mtp.target_context(), (i + 1) as i32);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let _ = mtp.accept(n_accepted as u16);
+                    let kept_end = target_base_pos + 1 + n_accepted as i32;
+                    if kept_end < n_cur {
+                        if !matches!(
+                            mtp.target_context_mut()
+                                .clear_kv_cache_seq(Some(0), Some(kept_end as u32), None),
+                            Ok(true)
+                        ) {
+                            *l1_valid = false;
+                        }
+                        n_cur = kept_end;
+                    }
+
+                    if hit_stop || n_cur as usize >= max_ctx_usize {
+                        break;
+                    }
+                    cur_token = next_token;
+                }
+                if vocab.is_eog(cur_token) {
+                    stop_reason = StopReason::EndTurn;
+                }
+            }
+        } else if use_ext_draft {
+            let ctx = slot.ctx_mut();
             let d_ctx = draft_ctx_opt.as_deref_mut().unwrap();
             let draft_k = inner.draft_max.min(16);
 
@@ -1235,12 +1395,14 @@ mod imp {
                 let mut d_tok = cur_token;
                 let draft_base_pos = draft_n_cur;
                 for _ in 0..draft_k {
+                    if draft_n_cur as usize >= max_ctx_usize {
+                        break;
+                    }
                     draft_batch.clear();
                     draft_batch.add(d_tok, draft_n_cur, &[0], true)?;
                     draft_n_cur += 1;
                     d_ctx.decode(&mut draft_batch).context("gagal decode draft")?;
-                    draft_last_idx = draft_batch.n_tokens() - 1;
-                    let proposed = draft_sampler.sample(d_ctx, draft_last_idx);
+                    let proposed = draft_sampler.sample(d_ctx, draft_batch.n_tokens() - 1);
                     if vocab.is_eog(proposed) {
                         break;
                     }
@@ -1255,6 +1417,9 @@ mod imp {
                 batch.add(cur_token, n_cur, &[0], true)?;
                 n_cur += 1;
                 for &dt in &drafted {
+                    if n_cur as usize >= max_ctx_usize {
+                        break;
+                    }
                     batch.add(dt, n_cur, &[0], true)?;
                     n_cur += 1;
                 }
@@ -1267,6 +1432,9 @@ mod imp {
                 let mut hit_stop = false;
 
                 for (i, &dt) in drafted.iter().enumerate() {
+                    if (i + 1) >= batch.n_tokens() as usize {
+                        break;
+                    }
                     if next_token == dt {
                         n_accepted += 1;
                         spec_accepted += 1;
@@ -1297,7 +1465,13 @@ mod imp {
                 // Roll back rejected tail in both target & draft KV caches
                 let kept_target_end = target_base_pos + 1 + n_accepted as i32;
                 if kept_target_end < n_cur {
-                    let _ = ctx.clear_kv_cache_seq(Some(0), Some(kept_target_end as u32), None);
+                    if !matches!(
+                        ctx.clear_kv_cache_seq(Some(0), Some(kept_target_end as u32), None),
+                        Ok(true)
+                    ) {
+                        *l1_valid = false;
+                        break;
+                    }
                     n_cur = kept_target_end;
                 }
                 let kept_draft_end = draft_base_pos + 1 + n_accepted as i32;
@@ -1306,7 +1480,7 @@ mod imp {
                     draft_n_cur = kept_draft_end;
                 }
 
-                if hit_stop {
+                if hit_stop || n_cur as usize >= max_ctx_usize {
                     break;
                 }
                 cur_token = next_token;
@@ -1315,6 +1489,7 @@ mod imp {
                 stop_reason = StopReason::EndTurn;
             }
         } else {
+            let ctx = slot.ctx_mut();
             for _ in 0..max_new {
                 // Note: LlamaSampler::sample() already calls accept(token) internally!
                 // Calling sampler.accept(token) again would double-feed stateful samplers like llguidance.
@@ -1340,6 +1515,11 @@ mod imp {
                     None => return Ok(()),
                     Some(true) => break,
                     Some(false) => {}
+                }
+
+                if n_cur as usize >= max_ctx_usize {
+                    stop_reason = StopReason::MaxTokens;
+                    break;
                 }
 
                 batch.clear();
@@ -1439,6 +1619,7 @@ mod imp {
         // Only trim & save when `clear_kv_cache_seq` returns `Ok(true)` (pure attention KV-cache);
         // on hybrid recurrent models (DeltaNet/Mamba), save the full sequence without partial trim.
         if should_persist_kv && *l1_valid {
+            let ctx = slot.ctx_mut();
             let prompt_len = prompt_tokens.len();
             let trimmed = matches!(
                 ctx.clear_kv_cache_seq(Some(0), Some(prompt_len as u32), None),

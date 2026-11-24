@@ -661,6 +661,7 @@ const state = {
   pendingImageDataUrl: null,
   pendingImageName: '',
   modelsLoaded: false,
+  isMultimodal: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -829,6 +830,10 @@ function clearPendingImage() {
 
 function attachImageFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
+  if (!state.isMultimodal) {
+    alert('Active model does not have a multimodal vision projector (--mmproj) loaded. Start cmod serve with --mmproj to use image input.');
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     state.pendingImageDataUrl = reader.result;
@@ -1330,17 +1335,33 @@ async function populateModelSelect(runningModel, detail) {
   state.modelsLoaded = true;
 }
 
+function authHeaders() {
+  const h = {};
+  const key = $('api-key-input').value.trim();
+  if (key) h['Authorization'] = 'Bearer ' + key;
+  return h;
+}
+
 async function pollStatus() {
   try {
-    const res = await fetch('/cmod/v1/status');
+    const res = await fetch('/cmod/v1/status', { headers: authHeaders() });
     const s = await res.json();
     $('status-dot').className = 'dot' + (s.backend?.ready ? '' : ' offline');
     const prevModel = state.activeModel;
     state.activeModel = s.backend?.model || 'unknown';
     state.maxModelLen = s.maxModelLen || 32768;
+    const detail = s.backend?.detail || '';
+    state.isMultimodal = detail.includes('multimodal=true');
+    const imgBtn = $('img-attach-btn');
+    imgBtn.disabled = !state.isMultimodal;
+    imgBtn.style.opacity = state.isMultimodal ? '1' : '0.45';
+    imgBtn.textContent = state.isMultimodal ? '+ Image' : '+ Image (no mmproj)';
+    imgBtn.title = state.isMultimodal
+      ? 'Attach image (VLM active)'
+      : 'Active model has no --mmproj vision projector loaded';
 
     if (!state.modelsLoaded || prevModel !== state.activeModel) {
-      await populateModelSelect(state.activeModel, s.backend?.detail || '');
+      await populateModelSelect(state.activeModel, detail);
       const t = getActiveThread();
       if (t && !t.messages.length) renderMessages();
     }
@@ -1381,9 +1402,10 @@ async function pollStatus() {
 
 async function loadModels() {
   try {
+    const h = authHeaders();
     const [locRes, recRes] = await Promise.all([
-      fetch('/cmod/v1/models/local'),
-      fetch('/cmod/v1/models/recommend'),
+      fetch('/cmod/v1/models/local', { headers: h }),
+      fetch('/cmod/v1/models/recommend', { headers: h }),
     ]);
     const loc = await locRes.json();
     const rec = await recRes.json();

@@ -38,11 +38,25 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-pub async fn hardware(State(state): State<AppState>) -> Response {
+fn unauthorized_json() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "API key tidak valid atau tidak diberikan" })),
+    )
+        .into_response()
+}
+
+pub async fn hardware(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return unauthorized_json();
+    }
     Json(state.hardware.as_ref()).into_response()
 }
 
-pub async fn status(State(state): State<AppState>) -> Response {
+pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return unauthorized_json();
+    }
     let backend = state.backend.health().await;
     let scheduler = state.scheduler.status();
     let kv_cache = state.kv_cache.stats();
@@ -70,7 +84,10 @@ pub async fn presets() -> Response {
 }
 
 /// Prometheus text exposition endpoint (`GET /metrics`) for Grafana & enterprise monitoring.
-pub async fn metrics(State(state): State<AppState>) -> Response {
+pub async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return unauthorized_json();
+    }
     let backend = state.backend.health().await;
     let sc = state.scheduler.status();
     let kv = state.kv_cache.stats();
@@ -144,7 +161,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-pub async fn recommend_models(State(state): State<AppState>) -> Response {
+pub async fn recommend_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return unauthorized_json();
+    }
     let dir = Path::new(&state.config.backend.models_dir);
     let recs = recommend_for_hardware(&state.hardware, dir);
     Json(json!({
@@ -159,7 +179,10 @@ pub async fn recommend_models(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-pub async fn local_models(State(state): State<AppState>) -> Response {
+pub async fn local_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return unauthorized_json();
+    }
     let dir = Path::new(&state.config.backend.models_dir);
     Json(json!({
         "modelsDir": state.config.backend.models_dir,

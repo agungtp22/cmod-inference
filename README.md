@@ -24,6 +24,14 @@ flowchart LR
 
 ## Key Features
 
+- **Built-in Web GUI (`cmod Studio` at `http://127.0.0.1:8790/`):**
+  - ChatGPT/Claude/OpenWebUI-style streaming chat with persistent local conversation history, safe Markdown & code-block rendering, collapsible Thinking blocks, live `tok/s` & `TTFT`, multimodal image upload (auto-guarded when `--mmproj` is active), Live Monitor, Model Manager/Downloader, and IDE Setup snippets.
+- **Universal Open-Weight Tool & Thinking Parser (Zero-Config Auto-Detection):**
+  - Supports **Qwen 2.5/3/3.5/3.8**, **MiMo-V2.6**, **Mistral v3 / Ministral-3 / Devstral**, **Google Gemma 4** (`<|tool>declaration:...`, `<|tool_call>call:...`, `<|channel>thought`), **DeepSeek V3/R1**, **OpenAI `gpt-oss` Harmony**, **Kimi-K2**, **GLM-4.5**, and **Llama 3/4** with bare-JSON fallback & lenient JSON quote/brace repair.
+- **Speculative Decoding (`--mtp` & `--draft-model`) + LoRA Adapters (`--lora`):**
+  - Native same-model **Multi-Token Prediction (`--mtp`)** via `llama_cpp_2::speculative::MtpSpeculative` and universal external **`--draft-model <path.gguf>`** (`--draft-max N`).
+  - In-process GGUF **LoRA adapter** hot-loading (`--lora ./adapter.gguf[:scale]`).
+  - Global **`--no-think`** flag + OpenAI `reasoning_effort` parsing, and **auto-pruning of old `tool_result` blocks** + `max_tokens` auto-clamping to prevent premature `context_length_exceeded` errors in long coding-agent sessions.
 - **Dual Native Protocols:**
   - **OpenAI:** `POST /v1/chat/completions` (streaming & non-streaming), `GET /v1/models`, `GET /v1/models/{id}`
   - **Anthropic:** `POST /v1/messages` (full SSE event sequence & `cache_control`), `POST /v1/messages/count_tokens`
