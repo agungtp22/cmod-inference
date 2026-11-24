@@ -4,6 +4,8 @@ use crate::ir::{CanonicalStreamEvent, ToolChoice, ToolDefinition};
 
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
+const GEMMA4_THINK_OPEN: &str = "<|channel>thought";
+const GEMMA4_THINK_CLOSE: &str = "<channel|>";
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
 const FUNC_OPEN: &str = "<function=";
@@ -103,16 +105,18 @@ impl NativeOutputParser {
             match self.state {
                 ParseState::Normal => {
                     let next_think = self.buf.find(THINK_OPEN);
+                    let next_gemma_think = self.buf.find(GEMMA4_THINK_OPEN);
                     let next_tool = self.buf.find(TOOL_OPEN);
                     let next_func = self.buf.find(FUNC_OPEN);
                     let next_mistral = self.buf.find(MISTRAL_TOOLS_OPEN);
 
-                    // Pick earliest opening tag among <think>, <tool_call>, <function=, and [TOOL_CALLS]
+                    // Pick earliest opening tag among <think>, <|channel>thought, <tool_call>, <function=, and [TOOL_CALLS]
                     let earliest = [
                         next_think.map(|i| (i, 0u8)),
                         next_tool.map(|i| (i, 1u8)),
                         next_func.map(|i| (i, 2u8)),
                         next_mistral.map(|i| (i, 3u8)),
+                        next_gemma_think.map(|i| (i, 4u8)),
                     ]
                     .into_iter()
                     .flatten()
@@ -122,6 +126,14 @@ impl NativeOutputParser {
                         Some((ti, 0)) => {
                             let before = self.buf[..ti].to_string();
                             self.buf.drain(..ti + THINK_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.state = ParseState::InThink;
+                        }
+                        Some((gi, 4)) => {
+                            let before = self.buf[..gi].to_string();
+                            self.buf.drain(..gi + GEMMA4_THINK_OPEN.len());
                             if !before.is_empty() {
                                 events.push(CanonicalStreamEvent::TextDelta(before));
                             }
@@ -157,7 +169,13 @@ impl NativeOutputParser {
                         _ => {
                             let keep = longest_tag_prefix(
                                 &self.buf,
-                                &[THINK_OPEN, TOOL_OPEN, FUNC_OPEN, MISTRAL_TOOLS_OPEN],
+                                &[
+                                    THINK_OPEN,
+                                    GEMMA4_THINK_OPEN,
+                                    TOOL_OPEN,
+                                    FUNC_OPEN,
+                                    MISTRAL_TOOLS_OPEN,
+                                ],
                             );
                             let emit_len = self.buf.len().saturating_sub(keep);
                             if emit_len > 0 {
@@ -171,14 +189,16 @@ impl NativeOutputParser {
                 }
                 ParseState::InThink => {
                     // Recover cleanly if a thinking model emits `<tool_call>` or `<function=`
-                    // while forgetting to close `</think>` first (common in MiMo/Qwen3.5).
+                    // while forgetting to close `</think>` / `<channel|>` first.
                     let next_close = self.buf.find(THINK_CLOSE);
+                    let next_gemma_close = self.buf.find(GEMMA4_THINK_CLOSE);
                     let next_tool = self.buf.find(TOOL_OPEN);
                     let next_func = self.buf.find(FUNC_OPEN);
                     let earliest = [
                         next_close.map(|i| (i, 0u8)),
                         next_tool.map(|i| (i, 1u8)),
                         next_func.map(|i| (i, 2u8)),
+                        next_gemma_close.map(|i| (i, 3u8)),
                     ]
                     .into_iter()
                     .flatten()
@@ -188,6 +208,14 @@ impl NativeOutputParser {
                         Some((end, 0)) => {
                             let think_txt = self.buf[..end].to_string();
                             self.buf.drain(..end + THINK_CLOSE.len());
+                            if !think_txt.is_empty() {
+                                events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
+                            }
+                            self.state = ParseState::Normal;
+                        }
+                        Some((end, 3)) => {
+                            let think_txt = self.buf[..end].to_string();
+                            self.buf.drain(..end + GEMMA4_THINK_CLOSE.len());
                             if !think_txt.is_empty() {
                                 events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
                             }
@@ -212,8 +240,10 @@ impl NativeOutputParser {
                             self.state = ParseState::InFuncCall;
                         }
                         _ => {
-                            let keep =
-                                longest_tag_prefix(&self.buf, &[THINK_CLOSE, TOOL_OPEN, FUNC_OPEN]);
+                            let keep = longest_tag_prefix(
+                                &self.buf,
+                                &[THINK_CLOSE, GEMMA4_THINK_CLOSE, TOOL_OPEN, FUNC_OPEN],
+                            );
                             let emit_len = self.buf.len().saturating_sub(keep);
                             if emit_len > 0 {
                                 let out = self.buf[..emit_len].to_string();

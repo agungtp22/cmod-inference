@@ -400,12 +400,16 @@ mod imp {
         }
 
         let tmpl_res = model.chat_template(None);
-        let is_mistral_tmpl = tmpl_res
+        let tmpl_str = tmpl_res
             .as_ref()
             .ok()
             .and_then(|t| t.to_str().ok())
-            .map(|s| s.contains("[SYSTEM_PROMPT]") || s.contains("[INST]"))
-            .unwrap_or(false);
+            .unwrap_or("");
+        let is_mistral_tmpl =
+            tmpl_str.contains("[SYSTEM_PROMPT]") || tmpl_str.contains("[INST]");
+        let is_gemma4_tmpl = tmpl_str.contains("<|turn>");
+        let is_gemma3_tmpl = !is_gemma4_tmpl && tmpl_str.contains("<start_of_turn>");
+        let is_llama3_tmpl = tmpl_str.contains("<|start_header_id|>");
 
         let mut rendered = if let Ok(ref tmpl) = tmpl_res {
             if let Ok(r) = model.apply_chat_template(tmpl, &chat_msgs, true) {
@@ -418,7 +422,126 @@ mod imp {
         };
 
         if rendered.is_empty() {
-            if is_mistral_tmpl {
+            if is_gemma4_tmpl {
+                // Native Google Gemma 4 turn format (`<|turn>role\n...<turn|>\n`)
+                if !sys_parts.is_empty() {
+                    rendered.push_str("<|turn>system\n");
+                    rendered.push_str(&sys_parts.join("\n\n"));
+                    rendered.push_str("<turn|>\n");
+                }
+                for msg in &req.messages {
+                    let role = match msg.role {
+                        Role::User => "user",
+                        Role::Assistant => "model",
+                        Role::Tool => "user",
+                    };
+                    rendered.push_str(&format!("<|turn>{role}\n"));
+                    for p in &msg.parts {
+                        match p {
+                            ContentPart::Text { text } => rendered.push_str(text),
+                            ContentPart::ToolResult {
+                                tool_call_id,
+                                content,
+                                ..
+                            } => rendered.push_str(&format!(
+                                "<|tool_response>[{tool_call_id}] {content}"
+                            )),
+                            ContentPart::ToolUse {
+                                name, arguments, ..
+                            } => rendered.push_str(&format!(
+                                "<tool_call>\n{{\"name\":\"{name}\",\"arguments\":{}}}\n</tool_call>",
+                                serde_json::to_string(arguments)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            )),
+                            ContentPart::Image { .. } => {
+                                #[cfg(feature = "multimodal")]
+                                rendered.push_str(llama_cpp_2::mtmd::mtmd_default_marker());
+                            }
+                        }
+                    }
+                    rendered.push_str("<turn|>\n");
+                }
+                rendered.push_str("<|turn>model\n");
+                if req.sampling.non_thinking {
+                    rendered.push_str("<|channel>thought\n<channel|>");
+                }
+            } else if is_gemma3_tmpl {
+                // Native Google Gemma 2 / Gemma 3 format (`<start_of_turn>role\n...<end_of_turn>\n`)
+                let mut sys_prefix = if !sys_parts.is_empty() {
+                    format!("{}\n\n", sys_parts.join("\n\n"))
+                } else {
+                    String::new()
+                };
+                for msg in &req.messages {
+                    let role = match msg.role {
+                        Role::Assistant => "model",
+                        _ => "user",
+                    };
+                    rendered.push_str(&format!("<start_of_turn>{role}\n"));
+                    if role == "user" && !sys_prefix.is_empty() {
+                        rendered.push_str(&sys_prefix);
+                        sys_prefix.clear();
+                    }
+                    for p in &msg.parts {
+                        match p {
+                            ContentPart::Text { text } => rendered.push_str(text),
+                            ContentPart::ToolResult {
+                                tool_call_id,
+                                content,
+                                ..
+                            } => rendered.push_str(&format!("[tool_result:{tool_call_id}] {content}")),
+                            ContentPart::ToolUse {
+                                name, arguments, ..
+                            } => rendered.push_str(&format!(
+                                "<tool_call>\n{{\"name\":\"{name}\",\"arguments\":{}}}\n</tool_call>",
+                                serde_json::to_string(arguments)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            )),
+                            ContentPart::Image { .. } => {
+                                #[cfg(feature = "multimodal")]
+                                rendered.push_str(llama_cpp_2::mtmd::mtmd_default_marker());
+                            }
+                        }
+                    }
+                    rendered.push_str("<end_of_turn>\n");
+                }
+                rendered.push_str("<start_of_turn>model\n");
+            } else if is_llama3_tmpl {
+                // Native Meta Llama 3 / 3.1 / 3.2 / 3.3 / 4 format
+                if !sys_parts.is_empty() {
+                    rendered.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
+                    rendered.push_str(&sys_parts.join("\n\n"));
+                    rendered.push_str("<|eot_id|>");
+                }
+                for msg in &req.messages {
+                    let role = match msg.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "ipython",
+                    };
+                    rendered.push_str(&format!("<|start_header_id|>{role}<|end_header_id|>\n\n"));
+                    for p in &msg.parts {
+                        match p {
+                            ContentPart::Text { text } => rendered.push_str(text),
+                            ContentPart::ToolResult {
+                                tool_call_id,
+                                content,
+                                ..
+                            } => rendered.push_str(&format!("[tool_result:{tool_call_id}] {content}")),
+                            ContentPart::ToolUse {
+                                name, arguments, ..
+                            } => rendered.push_str(&format!(
+                                "<tool_call>\n{{\"name\":\"{name}\",\"arguments\":{}}}\n</tool_call>",
+                                serde_json::to_string(arguments)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            )),
+                            _ => {}
+                        }
+                    }
+                    rendered.push_str("<|eot_id|>");
+                }
+                rendered.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            } else if is_mistral_tmpl {
                 // Native Mistral v3 / Ministral-3 Tekken chat format when llama_chat_apply_template
                 // cannot evaluate complex Jinja2 templates.
                 rendered.push_str("<s>");
