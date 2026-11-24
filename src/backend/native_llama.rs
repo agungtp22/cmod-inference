@@ -620,11 +620,18 @@ mod imp {
 
         if !used_mtmd {
 
-            // Tier 1 (L1 VRAM Hot Hit): reuse prefix already resident in this worker's VRAM
+            // Tier 1 (L1 VRAM Hot Hit): reuse prefix already resident in this worker's VRAM.
+            // Note: `clear_kv_cache_seq` returns `Ok(false)` on hybrid recurrent models (e.g. Qwen3.5/MiMo DeltaNet)
+            // when partial rollback isn't supported; we MUST check `Ok(true)` (or exact continuation).
             if *l1_valid && !l1_tokens.is_empty() && prompt_tokens.len() > 16 {
                 let matched = common_prefix_len(l1_tokens, &prompt_tokens);
                 if matched > 16 && matched < prompt_tokens.len() {
-                    if ctx.clear_kv_cache_seq(Some(0), Some(matched as u32), None).is_ok() {
+                    let can_reuse = matched == l1_tokens.len()
+                        || matches!(
+                            ctx.clear_kv_cache_seq(Some(0), Some(matched as u32), None),
+                            Ok(true)
+                        );
+                    if can_reuse {
                         cached_prefix_tokens = matched;
                         inner.kv_cache.record_l1_hit();
                     }
@@ -640,9 +647,14 @@ mod imp {
                         if matched > 16 && matched < prompt_tokens.len() {
                             if ctx.state_seq_set(&snap.state, 0).is_ok()
                                 && (matched == snap.tokens.len()
-                                    || ctx
-                                        .clear_kv_cache_seq(Some(0), Some(matched as u32), None)
-                                        .is_ok())
+                                    || matches!(
+                                        ctx.clear_kv_cache_seq(
+                                            Some(0),
+                                            Some(matched as u32),
+                                            None
+                                        ),
+                                        Ok(true)
+                                    ))
                             {
                                 cached_prefix_tokens = matched;
                                 inner.kv_cache.record_l2_hit();
@@ -659,9 +671,14 @@ mod imp {
                                 if matched > 16
                                     && matched < prompt_tokens.len()
                                     && (matched == disk_tokens.len()
-                                        || ctx
-                                            .clear_kv_cache_seq(Some(0), Some(matched as u32), None)
-                                            .is_ok())
+                                        || matches!(
+                                            ctx.clear_kv_cache_seq(
+                                                Some(0),
+                                                Some(matched as u32),
+                                                None
+                                            ),
+                                            Ok(true)
+                                        ))
                                 {
                                     cached_prefix_tokens = matched;
                                     inner.kv_cache.record_l3_hit();
@@ -826,29 +843,35 @@ mod imp {
         // Drop sender NOW so the HTTP response finishes immediately before L2/L3 KV-Cache flush!
         drop(tx);
 
-        // Post-response L2 Host RAM & L3 NVMe Disk KV-Cache persistence (off the client critical path)
+        // Post-response L2 Host RAM & L3 NVMe Disk KV-Cache persistence (off the client critical path).
+        // Only trim & save when `clear_kv_cache_seq` returns `Ok(true)` (pure attention KV-cache);
+        // on hybrid recurrent models (DeltaNet/Mamba), save the full sequence without partial trim.
         if should_persist_kv && *l1_valid {
             let prompt_len = prompt_tokens.len();
-            if ctx
-                .clear_kv_cache_seq(Some(0), Some(prompt_len as u32), None)
-                .is_ok()
-            {
+            let trimmed = matches!(
+                ctx.clear_kv_cache_seq(Some(0), Some(prompt_len as u32), None),
+                Ok(true)
+            );
+            let saved_tokens = if trimmed {
                 l1_tokens.truncate(prompt_len);
-                if let Ok(state) = ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
-                    inner.kv_cache.put_ram(
-                        cache_key.clone(),
-                        NativeKvSnapshot {
-                            state,
-                            tokens: prompt_tokens.clone(),
-                        },
-                    );
-                }
-                if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
-                    if let Err(err) = ctx.state_seq_save_file(&disk_path, 0, &prompt_tokens) {
-                        warn!("gagal menyimpan L3 KV-cache disk: {err}");
-                    } else {
-                        inner.kv_cache.enforce_disk_budget();
-                    }
+                prompt_tokens.clone()
+            } else {
+                l1_tokens.clone()
+            };
+            if let Ok(state) = ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
+                inner.kv_cache.put_ram(
+                    cache_key.clone(),
+                    NativeKvSnapshot {
+                        state,
+                        tokens: saved_tokens.clone(),
+                    },
+                );
+            }
+            if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
+                if let Err(err) = ctx.state_seq_save_file(&disk_path, 0, &saved_tokens) {
+                    warn!("gagal menyimpan L3 KV-cache disk: {err}");
+                } else {
+                    inner.kv_cache.enforce_disk_budget();
                 }
             }
         }
