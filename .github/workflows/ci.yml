@@ -5,31 +5,75 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test-gateway:
-    name: Test Gateway & Conformance (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run unit & conformance tests
-        run: cargo test --locked || cargo test
-      - name: Check release build (gateway)
-        run: cargo build --release
+  build-and-test:
+    name: Build & Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64 (Native CPU + Grammar + Multimodal)
+            os: ubuntu-latest
+            features: "native grammar multimodal"
+            artifact: cmod-inference-linux-x86_64
+            bin_name: cmod-inference
+          - label: macOS ARM64 (Native Metal + Multimodal)
+            os: macos-15
+            features: "metal multimodal"
+            artifact: cmod-inference-macos-arm64
+            bin_name: cmod-inference
+          - label: Windows x86_64 (Native CPU + Grammar + Multimodal)
+            os: windows-latest
+            features: "native grammar multimodal"
+            artifact: cmod-inference-windows-x86_64
+            bin_name: cmod-inference.exe
 
-  build-macos-metal:
-    name: Build & Test Native Metal (macOS ARM64)
-    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests with Metal & Multimodal features
-        run: cargo test --features "metal multimodal"
-      - name: Build release binary (Metal + Multimodal)
-        run: cargo build --release --features "metal multimodal"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev cmake ninja-build
+
+      - name: Configure LLVM/Clang for Windows bindgen
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Program Files\LLVM\bin\libclang.dll") {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            choco install llvm -y --no-progress
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Verify macOS runner is ARM64
+        if: runner.os == 'macOS'
+        run: |
+          ARCH=$(uname -m)
+          echo "Detected macOS arch: $ARCH"
+          test "$ARCH" = "arm64"
+
+      - name: Run unit & conformance tests
+        run: cargo test --features "${{ matrix.features }}"
+
+      - name: Build release binary
+        run: cargo build --release --features "${{ matrix.features }}"
+
+      - name: Upload release binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.bin_name }}
+          if-no-files-found: error

@@ -2,6 +2,36 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Return the global default directory for local `.gguf` models: `~/.cmod/models`
+/// (falls back to `./models` only if neither `HOME` nor `USERPROFILE` is set).
+pub fn default_models_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".cmod").join("models");
+        }
+    }
+    PathBuf::from("./models")
+}
+
+/// Expand a leading `~` or `~/` to the current user's home directory.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            if !home.is_empty() {
+                let rest = raw.trim_start_matches('~').trim_start_matches(['/', '\\']);
+                return if rest.is_empty() {
+                    PathBuf::from(home)
+                } else {
+                    PathBuf::from(home).join(rest)
+                };
+            }
+        }
+    }
+    path.to_path_buf()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -133,7 +163,7 @@ impl Default for BackendConfig {
             kv_cache_ram_mb: 2048,
             kv_cache_disk_mb: 16_384,
             kv_cache_dir: String::new(),
-            models_dir: "./models".to_string(),
+            models_dir: default_models_dir().display().to_string(),
             parallel_slots: 4,
             moe_cpu_offload: false,
             split_mode: "layer".to_string(),
@@ -279,8 +309,9 @@ impl InferenceConfig {
             self.backend.kv_cache_dir = v.trim().to_string();
         }
         if let Ok(v) = std::env::var("CMOD_INFERENCE_MODELS_DIR") {
-            if !v.trim().is_empty() {
-                self.backend.models_dir = v.trim().to_string();
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.backend.models_dir = expand_tilde(Path::new(trimmed)).display().to_string();
             }
         }
         if let Ok(v) = std::env::var("CMOD_INFERENCE_PARALLEL_SLOTS") {

@@ -12,7 +12,7 @@ use cmod_inference::backend::openai_upstream::OpenAiUpstreamBackend;
 use cmod_inference::backend::supervisor::ManagedLlamaServer;
 use cmod_inference::backend::InferenceBackend;
 use cmod_inference::cache::TieredKvCache;
-use cmod_inference::config::{BackendKind, InferenceConfig};
+use cmod_inference::config::{default_models_dir, expand_tilde, BackendKind, InferenceConfig};
 use cmod_inference::hardware::detect_hardware;
 use cmod_inference::models::{list_local_models, pull_model_cli, recommend_for_hardware, DownloadManager};
 use cmod_inference::presets::builtin_presets;
@@ -99,7 +99,7 @@ TIPS:
         #[arg(long)]
         model_path: Option<PathBuf>,
 
-        /// Direktori penyimpanan model lokal .gguf untuk Web UI & /cmod/v1/models/* (default: folder --model-path atau ./models)
+        /// Direktori penyimpanan model lokal .gguf untuk Web UI & /cmod/v1/models/* (default: ~/.cmod/models)
         #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
         models_dir: Option<PathBuf>,
 
@@ -191,23 +191,23 @@ TIPS:
     Hardware,
     /// Rekomendasikan 30 model GGUF terbaru (2025-2026) yang cocok untuk hardware mesin ini
     Recommend {
-        /// Folder penyimpanan model lokal (default: ./models)
-        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR", default_value = "./models")]
-        models_dir: PathBuf,
+        /// Folder penyimpanan model lokal (default: ~/.cmod/models)
+        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
     },
     /// Unduh model GGUF (+ mmproj jika multimodal) dari katalog terkurasi
     Pull {
         /// ID model dari `cmod-inference recommend` (contoh: qwen3-0.6b-tiny, qwen3-4b-doc, gemma-4-e4b-vlm)
         model_id: String,
-        /// Folder tujuan penyimpanan (default: ./models)
-        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR", default_value = "./models")]
-        models_dir: PathBuf,
+        /// Folder tujuan penyimpanan (default: ~/.cmod/models)
+        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
     },
     /// Lihat daftar file model .gguf yang sudah terunduh di lokal
     List {
-        /// Folder penyimpanan model lokal (default: ./models)
-        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR", default_value = "./models")]
-        models_dir: PathBuf,
+        /// Folder penyimpanan model lokal (default: ~/.cmod/models)
+        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
     },
     /// Tampilkan daftar preset model dokumen cmod (JSON)
     Presets,
@@ -245,6 +245,9 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::Recommend { models_dir } => {
+            let models_dir = models_dir
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(default_models_dir);
             let hw = detect_hardware();
             let recs = recommend_for_hardware(&hw, &models_dir);
             println!(
@@ -282,6 +285,9 @@ async fn main() -> Result<()> {
             model_id,
             models_dir,
         } => {
+            let models_dir = models_dir
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(default_models_dir);
             let mut last_pct: i32 = -1;
             let (path, mmproj) = pull_model_cli(&model_id, &models_dir, |file, dl, tot| {
                 if let Some(t) = tot.filter(|&t| t > 0) {
@@ -305,10 +311,14 @@ async fn main() -> Result<()> {
             }
         }
         Commands::List { models_dir } => {
+            let models_dir = models_dir
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(default_models_dir);
             let files = list_local_models(&models_dir);
             if files.is_empty() {
                 println!("Belum ada file .gguf di {}", models_dir.display());
             } else {
+                println!("Direktori model: {}", models_dir.display());
                 for f in files {
                     println!("{:<45} {:>6} MB  ({})", f.filename, f.size_mb, f.path);
                 }
@@ -405,22 +415,39 @@ async fn main() -> Result<()> {
             if let Some(m) = model {
                 cfg.backend.model = m;
             }
+            if let Some(md) = models_dir.as_ref() {
+                cfg.backend.models_dir = expand_tilde(md).display().to_string();
+            }
+            let effective_models_dir = expand_tilde(std::path::Path::new(&cfg.backend.models_dir));
+            let resolve_in_models_dir = |raw: &std::path::Path| -> PathBuf {
+                let expanded = expand_tilde(raw);
+                if expanded.exists() {
+                    return expanded;
+                }
+                let candidate = effective_models_dir.join(&expanded);
+                if candidate.exists() {
+                    return candidate;
+                }
+                expanded
+            };
             if let Some(mp) = model_path {
-                if models_dir.is_none() && cfg.backend.models_dir == "./models" {
-                    if let Some(parent) = mp.parent().filter(|p| !p.as_os_str().is_empty()) {
+                let resolved = resolve_in_models_dir(&mp);
+                let default_dir_str = default_models_dir().display().to_string();
+                if models_dir.is_none()
+                    && (cfg.backend.models_dir == default_dir_str
+                        || cfg.backend.models_dir == "./models")
+                {
+                    if let Some(parent) = resolved.parent().filter(|p| !p.as_os_str().is_empty()) {
                         cfg.backend.models_dir = parent.display().to_string();
                     }
                 }
-                cfg.backend.model_path = mp.display().to_string();
+                cfg.backend.model_path = resolved.display().to_string();
                 if matches!(cfg.backend.kind, BackendKind::Llamacpp) {
                     cfg.backend.manage_local_process = true;
                 }
             }
-            if let Some(md) = models_dir {
-                cfg.backend.models_dir = md.display().to_string();
-            }
             if let Some(mm) = mmproj {
-                cfg.backend.mmproj_path = mm.display().to_string();
+                cfg.backend.mmproj_path = resolve_in_models_dir(&mm).display().to_string();
             }
             if let Some(lora_spec) = lora {
                 let spec = lora_spec.trim();
@@ -444,7 +471,7 @@ async fn main() -> Result<()> {
                 cfg.backend.enable_mtp = true;
             }
             if let Some(dm) = draft_model {
-                cfg.backend.draft_model_path = dm.display().to_string();
+                cfg.backend.draft_model_path = resolve_in_models_dir(&dm).display().to_string();
             }
             if let Some(dmax) = draft_max {
                 cfg.backend.draft_max = dmax.clamp(1, 16);
