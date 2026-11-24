@@ -285,6 +285,33 @@ cmod stop
 
 ---
 
+## Web GUI (`cmod Studio`)
+
+`cmod-inference` ships with a zero-dependency embedded Web UI compiled directly into the binary — no Node.js, Docker, or separate frontend server required.
+
+Once `cmod serve` is running, open:
+
+```text
+http://127.0.0.1:8790/
+```
+
+*(or `http://<host>:<port>/` when bound with `--bind` / `--port`)*
+
+### Views & Capabilities
+
+| View | What It Does |
+|---|---|
+| **Chat** | ChatGPT / Claude / OpenWebUI-style streaming chat with collapsible left sidebar, persistent `localStorage` conversation history (`+ New Chat` / `⌘K`), System / Dark / Light theme toggle, safe pure-DOM Markdown + code-block copy rendering, collapsible **Thinking / Reasoning** accordion (`Think: Off / On`), and live `tok/s` + `TTFT` telemetry pill. |
+| **Multimodal Vision (`+ Image`)** | Attach, paste, or drag-and-drop images directly into the composer when the server is launched with `--mmproj <file.gguf>`. Automatically disabled with a tooltip when running a text-only model so images are never silently ignored. |
+| **Parameters Drawer (`⚙`)** | Slide-over panel for **System Prompt**, **Temperature** (`0.0–1.5`), **Max Tokens** (`128–4096`), **Priority Lane** (`interactive` vs `batch`), optional **API Key** (`Bearer` token when `--api-key` is enabled), and **Export Chat JSON**. |
+| **Live Monitor** | Real-time dashboard polling `/cmod/v1/status` — displays active backend, VRAM/RAM telemetry, scheduler lane utilization, and 3-Tier KV-Cache (`L1 VRAM` / `L2 RAM` / `L3 Disk`) hit counters. |
+| **Models & Pull** | Lists all locally downloaded `.gguf` files in `~/.cmod/models` (with copyable `cmod serve` commands) alongside the 30-model hardware-recommended catalog (`All` / `Recommended` / `Installed` filters) with one-click HTTP background download & progress tracking. |
+| **IDE & API Setup** | Ready-to-copy configuration snippets for **Zed**, **Claude Code**, **Continue / Cursor**, and OpenAI / Anthropic SDKs pre-filled with the active server URL and model ID. |
+
+> **Authentication:** If you start the server with `--api-key`, open the **Parameters Drawer (`⚙`)** and enter your key in the **API Key** field — it is stored locally in your browser and sent as `Authorization: Bearer <key>` to both chat and `/cmod/v1/*` control-plane endpoints.
+
+---
+
 ## Usage Examples
 
 ### OpenAI API (`/v1/chat/completions`) — Strict JSON Schema + Verbose
@@ -382,6 +409,7 @@ cmod serve --backend mlx --model mlx-community/Qwen3-4B-Instruct-2507-4bit
 
 | Plane | Endpoint | Description |
 |---|---|---|
+| **Web GUI** | `GET /` | Embedded `cmod Studio` Web UI (Chat, Live Monitor, Models & Pull, IDE Setup) |
 | **OpenAI** | `POST /v1/chat/completions` | Chat completions (streaming, JSON schema, tools, base64 images) |
 | **OpenAI** | `POST /v1/embeddings` | L2-normalized text embeddings (in-process GGUF or upstream/cluster) |
 | **OpenAI** | `GET /v1/models`, `GET /v1/models/{id}` | List / inspect active model and presets |
