@@ -170,22 +170,58 @@ impl NativeOutputParser {
                     }
                 }
                 ParseState::InThink => {
-                    if let Some(end) = self.buf.find(THINK_CLOSE) {
-                        let think_txt = self.buf[..end].to_string();
-                        self.buf.drain(..end + THINK_CLOSE.len());
-                        if !think_txt.is_empty() {
-                            events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
+                    // Recover cleanly if a thinking model emits `<tool_call>` or `<function=`
+                    // while forgetting to close `</think>` first (common in MiMo/Qwen3.5).
+                    let next_close = self.buf.find(THINK_CLOSE);
+                    let next_tool = self.buf.find(TOOL_OPEN);
+                    let next_func = self.buf.find(FUNC_OPEN);
+                    let earliest = [
+                        next_close.map(|i| (i, 0u8)),
+                        next_tool.map(|i| (i, 1u8)),
+                        next_func.map(|i| (i, 2u8)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min_by_key(|(i, _)| *i);
+
+                    match earliest {
+                        Some((end, 0)) => {
+                            let think_txt = self.buf[..end].to_string();
+                            self.buf.drain(..end + THINK_CLOSE.len());
+                            if !think_txt.is_empty() {
+                                events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
+                            }
+                            self.state = ParseState::Normal;
                         }
-                        self.state = ParseState::Normal;
-                    } else {
-                        let keep = longest_tag_prefix(&self.buf, &[THINK_CLOSE]);
-                        let emit_len = self.buf.len().saturating_sub(keep);
-                        if emit_len > 0 {
-                            let out = self.buf[..emit_len].to_string();
-                            self.buf.drain(..emit_len);
-                            events.push(CanonicalStreamEvent::ThinkingDelta(out));
+                        Some((ci, 1)) => {
+                            let think_txt = self.buf[..ci].to_string();
+                            self.buf.drain(..ci + TOOL_OPEN.len());
+                            if !think_txt.is_empty() {
+                                events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InToolCall;
                         }
-                        break;
+                        Some((fi, 2)) => {
+                            let think_txt = self.buf[..fi].to_string();
+                            self.buf.drain(..fi + FUNC_OPEN.len());
+                            if !think_txt.is_empty() {
+                                events.push(CanonicalStreamEvent::ThinkingDelta(think_txt));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InFuncCall;
+                        }
+                        _ => {
+                            let keep =
+                                longest_tag_prefix(&self.buf, &[THINK_CLOSE, TOOL_OPEN, FUNC_OPEN]);
+                            let emit_len = self.buf.len().saturating_sub(keep);
+                            if emit_len > 0 {
+                                let out = self.buf[..emit_len].to_string();
+                                self.buf.drain(..emit_len);
+                                events.push(CanonicalStreamEvent::ThinkingDelta(out));
+                            }
+                            break;
+                        }
                     }
                 }
                 ParseState::InToolCall => {
