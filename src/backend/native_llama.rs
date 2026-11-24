@@ -19,7 +19,9 @@ mod imp {
     use tokio::sync::mpsc;
     use tracing::{info, warn};
 
-    use crate::backend::parser::{format_tools_system_block, NativeOutputParser};
+    use crate::backend::parser::{
+        format_gemma4_tools_block, format_tools_system_block, NativeOutputParser,
+    };
     use crate::backend::{BackendHealth, EmbeddingResponse, EventStream, InferenceBackend};
     use crate::cache::{compute_model_fingerprint, NativeKvSnapshot, TieredKvCache};
     use crate::config::BackendConfig;
@@ -343,12 +345,22 @@ mod imp {
 
     fn format_prompt(model: &LlamaModel, req: &CanonicalRequest) -> Result<String> {
         let mut chat_msgs: Vec<LlamaChatMessage> = Vec::new();
+        let tmpl_res = model.chat_template(None);
+        let tmpl_str = tmpl_res
+            .as_ref()
+            .ok()
+            .and_then(|t| t.to_str().ok())
+            .unwrap_or("");
+        let is_gemma4_tmpl = tmpl_str.contains("<|turn>");
 
         let mut sys_parts: Vec<String> = req.system.iter().map(|b| b.text.clone()).collect();
-        if let Some(tool_block) =
+        let tool_block = if is_gemma4_tmpl {
+            format_gemma4_tools_block(&req.tools, req.tool_choice.as_ref())
+        } else {
             format_tools_system_block(&req.tools, req.tool_choice.as_ref())
-        {
-            sys_parts.push(tool_block);
+        };
+        if let Some(tb) = tool_block {
+            sys_parts.push(tb);
         }
         if !sys_parts.is_empty() {
             chat_msgs.push(
@@ -399,15 +411,8 @@ mod imp {
             );
         }
 
-        let tmpl_res = model.chat_template(None);
-        let tmpl_str = tmpl_res
-            .as_ref()
-            .ok()
-            .and_then(|t| t.to_str().ok())
-            .unwrap_or("");
         let is_mistral_tmpl =
             tmpl_str.contains("[SYSTEM_PROMPT]") || tmpl_str.contains("[INST]");
-        let is_gemma4_tmpl = tmpl_str.contains("<|turn>");
         let is_gemma3_tmpl = !is_gemma4_tmpl && tmpl_str.contains("<start_of_turn>");
         let is_llama3_tmpl = tmpl_str.contains("<|start_header_id|>");
 
@@ -640,6 +645,8 @@ mod imp {
         {
             if rendered.ends_with("<think>\n") {
                 rendered.push_str("\n</think>\n\n");
+            } else if rendered.ends_with("<|channel>thought\n") {
+                rendered.push_str("<channel|>");
             } else if rendered.ends_with("<|im_start|>assistant\n") {
                 rendered.push_str("<think>\n\n</think>\n\n");
             }
@@ -974,7 +981,13 @@ mod imp {
         let prefill_ms = req_started.elapsed().as_millis();
         let decode_started = std::time::Instant::now();
         let mut sampler = build_sampler(inner, &req, forced_tool_schema.as_ref());
-        let mut parser = NativeOutputParser::new();
+        let starts_in_think =
+            prompt.ends_with("<think>\n") || prompt.ends_with("<|channel>thought\n");
+        let mut parser = if starts_in_think && !req.sampling.non_thinking {
+            NativeOutputParser::new_in_think()
+        } else {
+            NativeOutputParser::new()
+        };
         let mut output_count: u64 = 0;
         let mut utf8_buf: Vec<u8> = Vec::new();
         let mut accumulated = String::new();

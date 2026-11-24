@@ -8,6 +8,8 @@ const GEMMA4_THINK_OPEN: &str = "<|channel>thought";
 const GEMMA4_THINK_CLOSE: &str = "<channel|>";
 const TOOL_OPEN: &str = "<tool_call>";
 const TOOL_CLOSE: &str = "</tool_call>";
+const GEMMA4_TOOL_OPEN: &str = "<|tool_call>";
+const GEMMA4_TOOL_CLOSE: &str = "<tool_call|>";
 const FUNC_OPEN: &str = "<function=";
 const FUNC_CLOSE: &str = "</function>";
 const MISTRAL_TOOLS_OPEN: &str = "[TOOL_CALLS]";
@@ -65,17 +67,59 @@ pub fn format_tools_system_block(
     ))
 }
 
+/// Format tool definitions in Google Gemma 4 native `<|tool>declaration:...<tool|>` syntax.
+pub fn format_gemma4_tools_block(
+    tools: &[ToolDefinition],
+    choice: Option<&ToolChoice>,
+) -> Option<String> {
+    if tools.is_empty() || matches!(choice, Some(ToolChoice::None)) {
+        return None;
+    }
+    let mut out = String::new();
+    for t in tools {
+        let desc = t.description.as_deref().unwrap_or("");
+        let params_str = format_gemma4_value(&t.input_schema);
+        out.push_str(&format!(
+            "<|tool>declaration:{}{{description:<|\"|>{}<|\"|>,parameters:{}}}<tool|>",
+            t.name, desc, params_str
+        ));
+    }
+    Some(out)
+}
+
+fn format_gemma4_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("<|\"|>{s}<|\"|>"),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_gemma4_value).collect();
+            format!("[{}]", items.join(","))
+        }
+        Value::Object(map) => {
+            let mut parts = Vec::with_capacity(map.len());
+            for (k, val) in map {
+                parts.push(format!("{k}:{}", format_gemma4_value(val)));
+            }
+            format!("{{{}}}", parts.join(","))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseState {
     Normal,
     InThink,
     InToolCall,
+    InGemmaToolCall,
     InFuncCall,
     InMistralTools,
 }
 
-/// Incremental streaming parser that separates `<think>...</think>` into `ThinkingDelta`,
-/// `<tool_call>...</tool_call>` into `ToolCallStart` + `ToolCallDelta`, and everything else into `TextDelta`.
+/// Incremental streaming parser that separates `<think>...</think>` / `<|channel>thought...<channel|>`
+/// into `ThinkingDelta`, `<tool_call>` / `<|tool_call>` / `<function=` / `[TOOL_CALLS]` into
+/// `ToolCallStart` + `ToolCallDelta`, and everything else into `TextDelta`.
 pub struct NativeOutputParser {
     state: ParseState,
     buf: String,
@@ -87,6 +131,17 @@ impl NativeOutputParser {
     pub fn new() -> Self {
         Self {
             state: ParseState::Normal,
+            buf: String::new(),
+            tool_buf: String::new(),
+            tool_count: 0,
+        }
+    }
+
+    /// Use when the prompt template itself already ended with an opening thought tag
+    /// (e.g. `<think>\n` or Gemma 4's `<|channel>thought\n`).
+    pub fn new_in_think() -> Self {
+        Self {
+            state: ParseState::InThink,
             buf: String::new(),
             tool_buf: String::new(),
             tool_count: 0,
@@ -107,16 +162,18 @@ impl NativeOutputParser {
                     let next_think = self.buf.find(THINK_OPEN);
                     let next_gemma_think = self.buf.find(GEMMA4_THINK_OPEN);
                     let next_tool = self.buf.find(TOOL_OPEN);
+                    let next_gemma_tool = self.buf.find(GEMMA4_TOOL_OPEN);
                     let next_func = self.buf.find(FUNC_OPEN);
                     let next_mistral = self.buf.find(MISTRAL_TOOLS_OPEN);
 
-                    // Pick earliest opening tag among <think>, <|channel>thought, <tool_call>, <function=, and [TOOL_CALLS]
+                    // Pick earliest opening tag among all supported formats
                     let earliest = [
                         next_think.map(|i| (i, 0u8)),
                         next_tool.map(|i| (i, 1u8)),
                         next_func.map(|i| (i, 2u8)),
                         next_mistral.map(|i| (i, 3u8)),
                         next_gemma_think.map(|i| (i, 4u8)),
+                        next_gemma_tool.map(|i| (i, 5u8)),
                     ]
                     .into_iter()
                     .flatten()
@@ -148,6 +205,15 @@ impl NativeOutputParser {
                             self.tool_buf.clear();
                             self.state = ParseState::InToolCall;
                         }
+                        Some((gi, 5)) => {
+                            let before = self.buf[..gi].to_string();
+                            self.buf.drain(..gi + GEMMA4_TOOL_OPEN.len());
+                            if !before.is_empty() {
+                                events.push(CanonicalStreamEvent::TextDelta(before));
+                            }
+                            self.tool_buf.clear();
+                            self.state = ParseState::InGemmaToolCall;
+                        }
                         Some((fi, 2)) => {
                             let before = self.buf[..fi].to_string();
                             self.buf.drain(..fi + FUNC_OPEN.len());
@@ -173,6 +239,7 @@ impl NativeOutputParser {
                                     THINK_OPEN,
                                     GEMMA4_THINK_OPEN,
                                     TOOL_OPEN,
+                                    GEMMA4_TOOL_OPEN,
                                     FUNC_OPEN,
                                     MISTRAL_TOOLS_OPEN,
                                 ],
@@ -270,6 +337,22 @@ impl NativeOutputParser {
                         break;
                     }
                 }
+                ParseState::InGemmaToolCall => {
+                    if let Some(end) = self.buf.find(GEMMA4_TOOL_CLOSE) {
+                        self.tool_buf.push_str(&self.buf[..end]);
+                        self.buf.drain(..end + GEMMA4_TOOL_CLOSE.len());
+                        self.emit_gemma4_tool_call(&mut events);
+                        self.state = ParseState::Normal;
+                    } else {
+                        let keep = longest_tag_prefix(&self.buf, &[GEMMA4_TOOL_CLOSE]);
+                        let take_len = self.buf.len().saturating_sub(keep);
+                        if take_len > 0 {
+                            self.tool_buf.push_str(&self.buf[..take_len]);
+                            self.buf.drain(..take_len);
+                        }
+                        break;
+                    }
+                }
                 ParseState::InFuncCall => {
                     if let Some(end) = self.buf.find(FUNC_CLOSE) {
                         self.tool_buf.push_str(&self.buf[..end]);
@@ -316,6 +399,11 @@ impl NativeOutputParser {
                 self.tool_buf.push_str(&self.buf);
                 self.buf.clear();
                 self.emit_tool_call(&mut events);
+            }
+            ParseState::InGemmaToolCall => {
+                self.tool_buf.push_str(&self.buf);
+                self.buf.clear();
+                self.emit_gemma4_tool_call(&mut events);
             }
             ParseState::InFuncCall => {
                 self.tool_buf.push_str(&self.buf);
@@ -368,6 +456,42 @@ impl NativeOutputParser {
             }
         }
         // Fallback: if invalid JSON inside <tool_call>, return raw text rather than dropping it
+        events.push(CanonicalStreamEvent::TextDelta(raw));
+    }
+
+    /// Parse Google Gemma 4 native `<|tool_call>call:NAME{key:<|"|>val<|"|>,...}<tool_call|>` format.
+    fn emit_gemma4_tool_call(&mut self, events: &mut Vec<CanonicalStreamEvent>) {
+        let raw = self.tool_buf.trim().to_string();
+        self.tool_buf.clear();
+        if raw.is_empty() {
+            return;
+        }
+        let body = raw.strip_prefix("call:").unwrap_or(&raw).trim();
+        let body = body.strip_prefix("default_api:").unwrap_or(body).trim();
+        if let Some((name_part, args_rest)) = body.split_once('{') {
+            let name = name_part.trim();
+            let args_with_braces = format!("{{{args_rest}");
+            if !name.is_empty() {
+                let json_like = gemma4_args_to_json(&args_with_braces);
+                if let Some(args_val) = parse_json_lenient(&json_like) {
+                    let idx = self.tool_count;
+                    self.tool_count += 1;
+                    let id = format!("call_native_{}", idx + 1);
+                    let args_str =
+                        serde_json::to_string(&args_val).unwrap_or_else(|_| "{}".to_string());
+                    events.push(CanonicalStreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name: name.to_string(),
+                    });
+                    events.push(CanonicalStreamEvent::ToolCallDelta {
+                        index: idx,
+                        arguments_delta: args_str,
+                    });
+                    return;
+                }
+            }
+        }
         events.push(CanonicalStreamEvent::TextDelta(raw));
     }
 
@@ -685,6 +809,61 @@ fn repair_broken_json(raw: &str) -> String {
     out
 }
 
+/// Convert Gemma 4's `{key:<|"|>val<|"|>,num:10}` argument syntax into standard JSON.
+fn gemma4_args_to_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut rest = raw;
+    let mut in_gemma_str = false;
+
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("<|\"|>") {
+            out.push('"');
+            in_gemma_str = !in_gemma_str;
+            rest = after;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        let ch_len = ch.len_utf8();
+        if in_gemma_str {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+            rest = &rest[ch_len..];
+        } else if ch == '{' || ch == ',' {
+            out.push(ch);
+            rest = &rest[ch_len..];
+            // Quote unquoted identifier keys immediately following `{` or `,`
+            let ws_len = rest.len() - rest.trim_start().len();
+            out.push_str(&rest[..ws_len]);
+            rest = &rest[ws_len..];
+            if let Some(colon_pos) = rest.find(':') {
+                let key_cand = rest[..colon_pos].trim();
+                if !key_cand.is_empty()
+                    && !key_cand.starts_with('"')
+                    && key_cand
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    out.push('"');
+                    out.push_str(key_cand);
+                    out.push('"');
+                    out.push(':');
+                    rest = &rest[colon_pos + 1..];
+                }
+            }
+        } else {
+            out.push(ch);
+            rest = &rest[ch_len..];
+        }
+    }
+    out
+}
+
 fn parse_xml_parameters(raw: &str) -> Option<Value> {
     const P_OPEN: &str = "<parameter=";
     const P_CLOSE: &str = "</parameter>";
@@ -857,5 +1036,33 @@ mod tests {
             })
             .collect();
         assert_eq!(names2, vec!["list_directory"]);
+    }
+
+    #[test]
+    fn parses_gemma4_native_thought_and_tool_calls() {
+        let mut p = NativeOutputParser::new_in_think();
+        let input = "Checking Go version<channel|><|tool_call>call:terminal{cd:<|\"|>/tmp/app<|\"|>,command:<|\"|>go version<|\"|>,timeout_ms:5000}<tool_call|>";
+        let mut events = p.push(input);
+        events.extend(p.finish());
+        assert!(p.had_tool_calls());
+        let mut thinking = String::new();
+        let mut name = String::new();
+        let mut args = String::new();
+        for ev in events {
+            match ev {
+                CanonicalStreamEvent::ThinkingDelta(d) => thinking.push_str(&d),
+                CanonicalStreamEvent::ToolCallStart { name: n, .. } => name = n,
+                CanonicalStreamEvent::ToolCallDelta { arguments_delta, .. } => {
+                    args.push_str(&arguments_delta)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(thinking, "Checking Go version");
+        assert_eq!(name, "terminal");
+        let parsed: Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(parsed["command"], "go version");
+        assert_eq!(parsed["cd"], "/tmp/app");
+        assert_eq!(parsed["timeout_ms"], 5000);
     }
 }
