@@ -450,6 +450,72 @@ impl NativeOutputParser {
     }
 }
 
+/// Fallback extractor for models (e.g. MiMo-V2.6, Qwen, Llama) that occasionally emit a
+/// bare JSON tool call `{"name": "...", "arguments": {...}}` without `<tool_call>` tags
+/// after several turns of tool use. Only matches when `"name"` is in `allowed_tools`
+/// to prevent false positives on ordinary JSON prose.
+pub fn extract_bare_tool_calls(
+    raw_output: &str,
+    allowed_tools: &[&str],
+) -> Vec<(String, String)> {
+    if allowed_tools.is_empty() {
+        return Vec::new();
+    }
+    // Strip any `<think>...</think>` prefix so we only inspect the visible answer.
+    let body = if let Some(idx) = raw_output.rfind(THINK_CLOSE) {
+        &raw_output[idx + THINK_CLOSE.len()..]
+    } else {
+        raw_output
+    };
+    let trimmed = body.trim();
+    // Unwrap optional ```json ... ``` code fences.
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    // Find the first `{` or `[` to tolerate a short preamble sentence before the JSON object.
+    let json_slice = match candidate.find(|c| c == '{' || c == '[') {
+        Some(start) => &candidate[start..],
+        None => return Vec::new(),
+    };
+
+    let parsed: Value = match serde_json::from_str(json_slice) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let items: Vec<&Value> = match &parsed {
+        Value::Object(_) => vec![&parsed],
+        Value::Array(arr) => arr.iter().collect(),
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for item in items {
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !allowed_tools.contains(&name) {
+            continue;
+        }
+        let Some(args) = item
+            .get("arguments")
+            .or_else(|| item.get("parameters"))
+            .or_else(|| item.get("input"))
+        else {
+            continue;
+        };
+        if args.is_object() {
+            let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+            out.push((name.to_string(), args_str));
+        }
+    }
+    out
+}
+
 fn parse_xml_parameters(raw: &str) -> Option<Value> {
     const P_OPEN: &str = "<parameter=";
     const P_CLOSE: &str = "</parameter>";
@@ -562,5 +628,18 @@ mod tests {
         }
         assert_eq!(name, "list_directory");
         assert_eq!(args, "{\"path\":\"/Users/test/agentcode\"}");
+    }
+
+    #[test]
+    fn extracts_bare_json_tool_call_only_for_declared_tools() {
+        let raw = "<think>Check git status</think>\n{\"id\":\"call_native_1\",\"name\":\"terminal\",\"arguments\":{\"command\":\"git status\",\"cd\":\"/tmp\"}}";
+        let calls = extract_bare_tool_calls(raw, &["list_directory", "terminal"]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "terminal");
+        assert!(calls[0].1.contains("\"command\":\"git status\""));
+
+        // Must NOT trigger for undeclared tool names
+        let none = extract_bare_tool_calls(raw, &["list_directory"]);
+        assert!(none.is_empty());
     }
 }

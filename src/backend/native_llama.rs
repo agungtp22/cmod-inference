@@ -332,11 +332,11 @@ mod imp {
                         ..
                     } => text_parts.push(format!("[tool_result:{tool_call_id}] {content}")),
                     ContentPart::ToolUse {
-                        id,
+                        id: _,
                         name,
                         arguments,
                     } => text_parts.push(format!(
-                        "<tool_call>\n{{\"id\":\"{id}\",\"name\":\"{name}\",\"arguments\":{}}}\n</tool_call>",
+                        "<tool_call>\n{{\"name\":\"{name}\",\"arguments\":{}}}\n</tool_call>",
                         serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string())
                     )),
                     ContentPart::Image { mime_type, .. } => {
@@ -831,6 +831,27 @@ mod imp {
             }
             if parser.had_tool_calls() {
                 stop_reason = StopReason::ToolUse;
+            } else if !req.tools.is_empty() {
+                let allowed: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+                let recovered = crate::backend::parser::extract_bare_tool_calls(
+                    &accumulated,
+                    &allowed,
+                );
+                if !recovered.is_empty() {
+                    for (idx, (name, args_str)) in recovered.into_iter().enumerate() {
+                        let call_id = format!("call_native_{}", idx + 1);
+                        let _ = tx.send(Ok(CanonicalStreamEvent::ToolCallStart {
+                            index: idx,
+                            id: call_id,
+                            name,
+                        }));
+                        let _ = tx.send(Ok(CanonicalStreamEvent::ToolCallDelta {
+                            index: idx,
+                            arguments_delta: args_str,
+                        }));
+                    }
+                    stop_reason = StopReason::ToolUse;
+                }
             }
         }
 
