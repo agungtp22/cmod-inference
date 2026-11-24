@@ -103,6 +103,14 @@ TIPS:
         #[arg(long)]
         mmproj: Option<PathBuf>,
 
+        /// Path file LoRA adapter .gguf (opsional, format: PATH atau PATH:SCALE, mis. ./adapter.gguf:0.8)
+        #[arg(long)]
+        lora: Option<String>,
+
+        /// Matikan blok <think> secara default untuk semua request (setara enable_thinking=false)
+        #[arg(long)]
+        no_think: bool,
+
         /// Panjang context window maksimal dalam token (default: 32768, min: 1024)
         #[arg(long)]
         ctx: Option<u32>,
@@ -309,6 +317,8 @@ async fn main() -> Result<()> {
             model,
             model_path,
             mmproj,
+            lora,
+            no_think,
             ctx,
             slots,
             gpu_layers,
@@ -383,6 +393,24 @@ async fn main() -> Result<()> {
             }
             if let Some(mm) = mmproj {
                 cfg.backend.mmproj_path = mm.display().to_string();
+            }
+            if let Some(lora_spec) = lora {
+                let spec = lora_spec.trim();
+                if let Some((path_part, scale_part)) = spec.rsplit_once(':') {
+                    if let Ok(scale) = scale_part.trim().parse::<f32>() {
+                        cfg.backend.lora_path = path_part.trim().to_string();
+                        cfg.backend.lora_scale = scale;
+                    } else {
+                        cfg.backend.lora_path = spec.to_string();
+                        cfg.backend.lora_scale = 1.0;
+                    }
+                } else {
+                    cfg.backend.lora_path = spec.to_string();
+                    cfg.backend.lora_scale = 1.0;
+                }
+            }
+            if no_think {
+                cfg.backend.default_non_thinking = true;
             }
             if let Some(c) = ctx {
                 cfg.backend.max_model_len = c;

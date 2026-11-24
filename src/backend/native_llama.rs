@@ -13,7 +13,7 @@ mod imp {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
-    use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
+    use llama_cpp_2::model::{LlamaChatMessage, LlamaLoraAdapter, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
     use llama_cpp_2::token::LlamaToken;
     use tokio::sync::mpsc;
@@ -50,6 +50,7 @@ mod imp {
         tok_env: toktrie::TokEnv,
         #[cfg(feature = "multimodal")]
         mmproj_path: Option<String>,
+        lora_adapter: Option<(std::sync::Mutex<LlamaLoraAdapter>, f32, String)>,
     }
 
     unsafe impl Send for NativeEngineInner {}
@@ -168,8 +169,33 @@ mod imp {
                 "Memuat model GGUF langsung ke in-process native engine dengan VRAM Context Pool"
             );
 
-            let model = LlamaModel::load_from_file(&backend, path, &model_params)
+            let mut model = LlamaModel::load_from_file(&backend, path, &model_params)
                 .with_context(|| format!("gagal memuat model GGUF {}", path.display()))?;
+
+            let lora_adapter = if !cfg.lora_path.trim().is_empty() {
+                let lora_p = Path::new(cfg.lora_path.trim());
+                if !lora_p.exists() {
+                    return Err(anyhow!(
+                        "File LoRA adapter GGUF tidak ditemukan: {}",
+                        lora_p.display()
+                    ));
+                }
+                let adapter = model
+                    .lora_adapter_init(lora_p)
+                    .map_err(|e| anyhow!("gagal memuat LoRA adapter {}: {e:?}", lora_p.display()))?;
+                info!(
+                    lora_path = %lora_p.display(),
+                    lora_scale = cfg.lora_scale,
+                    "LoRA adapter GGUF berhasil dimuat in-process"
+                );
+                Some((
+                    std::sync::Mutex::new(adapter),
+                    cfg.lora_scale,
+                    cfg.lora_path.trim().to_string(),
+                ))
+            } else {
+                None
+            };
 
             #[cfg(feature = "grammar")]
             let tok_env = {
@@ -205,6 +231,7 @@ mod imp {
                 tok_env,
                 #[cfg(feature = "multimodal")]
                 mmproj_path,
+                lora_adapter,
             });
 
             // Spawn `pool_size` persistent worker threads sequentially so GPU backends
@@ -238,9 +265,10 @@ mod imp {
         rx: std::sync::mpsc::Receiver<GenerationJob>,
         ready_tx: std::sync::mpsc::SyncSender<Result<()>>,
     ) {
+        let batch_cap_u32 = inner.max_model_len.min(2048);
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(inner.max_model_len))
-            .with_n_batch(512)
+            .with_n_batch(batch_cap_u32)
             .with_n_threads(inner.n_threads)
             .with_n_threads_batch(inner.n_threads)
             .with_type_k(inner.kv_cache_quant)
@@ -256,6 +284,19 @@ mod imp {
                 return;
             }
         };
+
+        if let Some((ref adapter_mtx, scale, ref path_label)) = inner.lora_adapter {
+            let mut guard = adapter_mtx.lock().unwrap();
+            if let Err(err) = ctx.lora_adapter_set(&mut guard, scale) {
+                warn!(slot_idx, lora = %path_label, "gagal memasang LoRA adapter ke slot: {err:?}");
+                let _ = ready_tx.send(Err(anyhow!(
+                    "gagal memasang LoRA adapter {} ke slot {slot_idx}: {err:?}",
+                    path_label
+                )));
+                return;
+            }
+            info!(slot_idx, lora = %path_label, scale, "LoRA adapter aktif di worker slot");
+        }
 
         // Quick Win #5: pre-load persistent MtmdContext once per worker slot (avoids reloading mmproj per image request)
         #[cfg(feature = "multimodal")]
@@ -555,7 +596,7 @@ mod imp {
         let mut n_cur: i32;
         let mut last_logit_idx: i32;
         let mut cached_prefix_tokens: usize = 0;
-        let batch_cap = 512usize;
+        let batch_cap = (inner.max_model_len as usize).min(2048);
         let mut batch = LlamaBatch::new(batch_cap, 1);
 
         #[cfg(feature = "multimodal")]
@@ -1027,7 +1068,7 @@ mod imp {
                     upstream_url: format!("in-process://{}", inner.model_path),
                     model: inner.model_id.clone(),
                     detail: Some(format!(
-                        "vram_slots={}, ctx={}, gpu_layers={}, split={}, moe_offload={}, fp={}, grammar={}, multimodal={}",
+                        "vram_slots={}, ctx={}, gpu_layers={}, split={}, moe_offload={}, fp={}, grammar={}, multimodal={}, lora={}",
                         slots,
                         inner.max_model_len,
                         inner.gpu_layers,
@@ -1035,7 +1076,8 @@ mod imp {
                         inner.moe_cpu_offload,
                         inner.model_fingerprint,
                         cfg!(feature = "grammar"),
-                        mm
+                        mm,
+                        inner.lora_adapter.is_some()
                     )),
                 }
             })

@@ -48,6 +48,8 @@ pub struct OpenAiChatRequest {
     #[serde(default)]
     pub think: Option<bool>,
     #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub chat_template_kwargs: Option<Value>,
     #[serde(default)]
     pub verbose: bool,
@@ -77,6 +79,7 @@ fn unix_ts() -> u64 {
 fn parse_openai_to_canonical(
     req: OpenAiChatRequest,
     default_model: &str,
+    default_non_thinking: bool,
     priority: crate::ir::PriorityLane,
 ) -> Result<CanonicalRequest, String> {
     let mut system = Vec::new();
@@ -258,11 +261,21 @@ fn parse_openai_to_canonical(
             req.chat_template_kwargs
                 .as_ref()
                 .and_then(|kw| kw.get("enable_thinking").and_then(Value::as_bool))
+        })
+        .or_else(|| {
+            req.reasoning_effort.as_deref().and_then(|eff| {
+                match eff.trim().to_ascii_lowercase().as_str() {
+                    "none" | "off" | "disabled" | "0" => Some(false),
+                    "low" | "medium" | "high" | "minimal" => Some(true),
+                    _ => None,
+                }
+            })
         });
     let non_thinking = match explicit_enable_thinking {
         Some(enabled) => !enabled,
         None => {
-            preset.as_ref().map(|p| p.non_thinking).unwrap_or(false)
+            default_non_thinking
+                || preset.as_ref().map(|p| p.non_thinking).unwrap_or(false)
                 || !matches!(response_format, ResponseFormat::Text)
         }
     };
@@ -418,8 +431,12 @@ pub async fn chat_completions(
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
     let priority = extract_priority(&headers);
-    let mut canonical = match parse_openai_to_canonical(body, state.backend.default_model(), priority)
-    {
+    let mut canonical = match parse_openai_to_canonical(
+        body,
+        state.backend.default_model(),
+        state.config.backend.default_non_thinking,
+        priority,
+    ) {
         Ok(req) => req,
         Err(msg) => {
             return openai_error(

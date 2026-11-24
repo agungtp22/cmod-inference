@@ -77,6 +77,12 @@ pub struct BackendConfig {
     pub mlx_server_bin: String,
     pub model_path: String,
     pub mmproj_path: String,
+    /// Optional LoRA GGUF adapter path applied on top of the base model (native backend)
+    pub lora_path: String,
+    /// Scale factor for the LoRA adapter (default: 1.0)
+    pub lora_scale: f32,
+    /// Force non-thinking mode by default unless overridden per request (`--no-think`)
+    pub default_non_thinking: bool,
     pub gpu_layers: i32,
     pub kv_cache_quant: String,
     pub kv_cache_ram_mb: u64,
@@ -110,6 +116,9 @@ impl Default for BackendConfig {
             mlx_server_bin: "mlx_lm.server".to_string(),
             model_path: String::new(),
             mmproj_path: String::new(),
+            lora_path: String::new(),
+            lora_scale: 1.0,
+            default_non_thinking: false,
             gpu_layers: -1,
             kv_cache_quant: "q8_0".to_string(),
             kv_cache_ram_mb: 2048,
