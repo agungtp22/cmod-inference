@@ -8,59 +8,68 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
-    name: Build & Test (${{ matrix.label }})
+  # Fast, low-quota check on regular pushes to main & pull requests
+  ci-check:
+    name: CI Check (Linux x86_64)
+    if: "!startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch'"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev cmake ninja-build
+      - name: Run unit & conformance tests
+        run: cargo test --features "native grammar multimodal"
+
+  # Full 5-target release matrix: runs ONLY on v* tags or manual workflow_dispatch
+  release-build:
+    name: Release Build (${{ matrix.label }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: Linux x86_64 CPU (Native + Grammar + Multimodal)
+          - label: Linux x86_64 CPU (.deb + .tar.gz)
             os: ubuntu-24.04
             features: "native grammar multimodal"
             artifact: cmod-inference-linux-x86_64
-            bin_name: cmod-inference
             accel: cpu
-          - label: Linux x86_64 CUDA (NVIDIA T4/L4/A100/H100/RTX)
+          - label: Linux x86_64 CUDA 12.8 (.deb + .tar.gz)
             os: ubuntu-24.04
             features: "cuda multimodal"
             artifact: cmod-inference-linux-x86_64-cuda
-            bin_name: cmod-inference
             accel: cuda
-          - label: Linux x86_64 ROCm (AMD Radeon/Instinct HIP)
-            os: ubuntu-24.04
-            features: "rocm multimodal"
-            artifact: cmod-inference-linux-x86_64-rocm
-            bin_name: cmod-inference
-            accel: rocm
-          - label: Linux x86_64 Vulkan (Cross-Vendor AMD/Intel/NVIDIA)
+          - label: Linux x86_64 Vulkan (.deb + .tar.gz)
             os: ubuntu-24.04
             features: "vulkan multimodal"
             artifact: cmod-inference-linux-x86_64-vulkan
-            bin_name: cmod-inference
             accel: vulkan
-          - label: macOS ARM64 (Native Metal + Multimodal)
+          - label: macOS ARM64 Metal (.tar.gz)
             os: macos-15
             features: "metal multimodal"
             artifact: cmod-inference-macos-arm64
-            bin_name: cmod-inference
             accel: metal
-          - label: Windows x86_64 (Native CPU + Grammar + Multimodal)
+          - label: Windows x86_64 (.zip)
             os: windows-latest
             features: "native grammar multimodal"
             artifact: cmod-inference-windows-x86_64
-            bin_name: cmod-inference.exe
             accel: cpu
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Linux base build dependencies
@@ -69,7 +78,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libclang-dev cmake ninja-build
 
-      - name: Install NVIDIA CUDA Toolkit (minimal nvcc + cublas)
+      - name: Install NVIDIA CUDA 12.8 Toolkit (minimal nvcc + cublas)
         if: runner.os == 'Linux' && matrix.accel == 'cuda'
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -82,14 +91,6 @@ jobs:
           echo "LIBRARY_PATH=/usr/local/cuda-12.8/lib64/stubs:/usr/local/cuda-12.8/lib64" >> "$GITHUB_ENV"
           echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
           /usr/local/cuda-12.8/bin/nvcc --version
-
-      - name: Install AMD ROCm / HIP build dependencies
-        if: runner.os == 'Linux' && matrix.accel == 'rocm'
-        run: |
-          sudo apt-get install -y --no-install-recommends hipcc libhipblas-dev librocblas-dev
-          echo "HIP_PATH=/usr" >> "$GITHUB_ENV"
-          echo "AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx90a;gfx942" >> "$GITHUB_ENV"
-          hipcc --version
 
       - name: Install Vulkan build dependencies
         if: runner.os == 'Linux' && matrix.accel == 'vulkan'
@@ -120,7 +121,7 @@ jobs:
         run: cargo test --features "${{ matrix.features }}"
 
       - name: Compile tests (GPU backend on GPU-less runner)
-        if: matrix.accel == 'cuda' || matrix.accel == 'rocm' || matrix.accel == 'vulkan'
+        if: matrix.accel == 'cuda' || matrix.accel == 'vulkan'
         run: cargo test --no-run --features "${{ matrix.features }}"
 
       - name: Build release binary
@@ -138,12 +139,6 @@ jobs:
               DESC_SUFFIX=" (NVIDIA CUDA 12.8: T4/L4/A100/H100/RTX)"
               EXTRA_DEPS=""
               ;;
-            rocm)
-              DEB_PREFIX="cmod-inference-rocm"
-              TAR_NAME="cmod-inference-linux-x86_64-rocm.tar.gz"
-              DESC_SUFFIX=" (AMD ROCm HIP: Radeon RX 6000/7000 & Instinct)"
-              EXTRA_DEPS=""
-              ;;
             vulkan)
               DEB_PREFIX="cmod-inference-vulkan"
               TAR_NAME="cmod-inference-linux-x86_64-vulkan.tar.gz"
@@ -157,7 +152,6 @@ jobs:
               EXTRA_DEPS=""
               ;;
           esac
-          # 1. Debian (.deb) installer
           PKG_DIR="target/deb/${DEB_PREFIX}_${VERSION}_amd64"
           mkdir -p "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/doc/cmod-inference"
           install -m 755 target/release/cmod-inference "${PKG_DIR}/usr/bin/cmod-inference"
@@ -180,7 +174,6 @@ jobs:
           EOF
           dpkg-deb --build --root-owner-group "${PKG_DIR}"
           cp "target/deb/${DEB_PREFIX}_${VERSION}_amd64.deb" dist/
-          # 2. Tarball
           tar -czf "dist/${TAR_NAME}" -C target/release cmod-inference
           ls -lh dist/
 
@@ -208,9 +201,9 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    needs: build-and-test
+    needs: release-build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

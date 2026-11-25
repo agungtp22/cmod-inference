@@ -199,6 +199,19 @@ case "$OS" in
       if [ "$ACCEL" != "auto" ]; then
         die "Requested ${wanted} package (${cand}) is not available in release ${VERSION}."
       fi
+      # If AMD ROCm package isn't published, gracefully try Vulkan GPU before falling back to CPU
+      if [ "$wanted" = "rocm" ]; then
+        if [ "$pkg_kind" = "deb" ]; then
+          vk_cand="cmod-inference-vulkan_${VER_NUM}_amd64.deb"
+        else
+          vk_cand="cmod-inference-linux-x86_64-vulkan.tar.gz"
+        fi
+        if curl -fsI "${BASE_URL}/${vk_cand}" >/dev/null 2>&1; then
+          warn "${cand} not in release ${VERSION}; using Vulkan GPU package (${vk_cand}) for AMD GPU."
+          printf "%s" "$vk_cand"
+          return 0
+        fi
+      fi
       warn "${cand} not available in release ${VERSION}; falling back to CPU package (${fallback})."
       printf "%s" "$fallback"
     }
