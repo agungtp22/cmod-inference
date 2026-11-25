@@ -20,25 +20,25 @@ jobs:
       matrix:
         include:
           - label: Linux x86_64 CPU (Native + Grammar + Multimodal)
-            os: ubuntu-latest
+            os: ubuntu-24.04
             features: "native grammar multimodal"
             artifact: cmod-inference-linux-x86_64
             bin_name: cmod-inference
             accel: cpu
           - label: Linux x86_64 CUDA (NVIDIA T4/L4/A100/H100/RTX)
-            os: ubuntu-latest
+            os: ubuntu-24.04
             features: "cuda multimodal"
             artifact: cmod-inference-linux-x86_64-cuda
             bin_name: cmod-inference
             accel: cuda
           - label: Linux x86_64 ROCm (AMD Radeon/Instinct HIP)
-            os: ubuntu-latest
+            os: ubuntu-24.04
             features: "rocm multimodal"
             artifact: cmod-inference-linux-x86_64-rocm
             bin_name: cmod-inference
             accel: rocm
           - label: Linux x86_64 Vulkan (Cross-Vendor AMD/Intel/NVIDIA)
-            os: ubuntu-latest
+            os: ubuntu-24.04
             features: "vulkan multimodal"
             artifact: cmod-inference-linux-x86_64-vulkan
             bin_name: cmod-inference
