@@ -1,6 +1,6 @@
 [package]
 name = "cmod-inference"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Standalone multi-GPU Local Document Intelligence inference gateway & supervisor for cmod with native OpenAI and Anthropic APIs"
