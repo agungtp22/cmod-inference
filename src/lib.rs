@@ -8,6 +8,7 @@ pub mod ir;
 pub mod models;
 pub mod presets;
 pub mod protocol;
+pub mod scanner;
 pub mod scheduler;
 pub mod ui;
 
@@ -82,6 +83,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/cmod/v1/presets", get(control::presets))
         .route("/cmod/v1/models/recommend", get(control::recommend_models))
         .route("/cmod/v1/models/local", get(control::local_models))
+        .route("/cmod/v1/models/scan", post(control::scan_model))
         .route("/cmod/v1/models/pull", post(control::start_model_pull))
         .route("/cmod/v1/models/pull/{id}", get(control::model_pull_status))
         .layer(cors)

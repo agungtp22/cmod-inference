@@ -16,6 +16,7 @@ use cmod_inference::config::{default_models_dir, expand_tilde, BackendKind, Infe
 use cmod_inference::hardware::detect_hardware;
 use cmod_inference::models::{list_local_models, pull_model_cli, recommend_for_hardware, DownloadManager};
 use cmod_inference::presets::builtin_presets;
+use cmod_inference::scanner::{scan_gguf_model, ScanSeverity, ScanVerdict};
 use cmod_inference::scheduler::PriorityScheduler;
 use cmod_inference::{build_router, AppState};
 
@@ -187,6 +188,14 @@ TIPS:
         #[arg(long)]
         upstream_url: Option<String>,
 
+        /// Verifikasi keamanan struktur GGUF & chat_template sebelum memuat model ke engine
+        #[arg(long)]
+        verify_model: bool,
+
+        /// Wajibkan checksum SHA-256 file model cocok sebelum memuat ke engine (mode strict enterprise)
+        #[arg(long, env = "CMOD_INFERENCE_REQUIRE_SHA256")]
+        require_sha256: Option<String>,
+
         /// Tampilkan log mentah C++ llama.cpp / Metal / CUDA di stderr
         #[arg(long)]
         llama_logs: bool,
@@ -212,6 +221,23 @@ TIPS:
         /// Folder penyimpanan model lokal (default: ~/.cmod/models)
         #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
         models_dir: Option<PathBuf>,
+    },
+    /// Audit keamanan file model .gguf (struktur biner, tensor bounds, chat_template SSTI/injection, & SHA-256)
+    Scan {
+        /// Path atau nama file .gguf (otomatis dicari di ~/.cmod/models jika hanya nama file)
+        model: PathBuf,
+        /// Folder penyimpanan model lokal (default: ~/.cmod/models)
+        #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+        /// Hitung checksum SHA-256 penuh file model
+        #[arg(long)]
+        sha256: bool,
+        /// Verifikasi SHA-256 file terhadap hash yang diharapkan (keluar error jika tidak cocok)
+        #[arg(long)]
+        expected_sha256: Option<String>,
+        /// Tampilkan hasil audit dalam format JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Tampilkan daftar preset model dokumen cmod (JSON)
     Presets,
@@ -309,7 +335,10 @@ async fn main() -> Result<()> {
             })
             .await?;
             eprintln!();
-            println!("Selesai! Model tersimpan di: {}", path.display());
+            println!(
+                "Selesai! Model terverifikasi (SHA-256 & security scan PASS) di: {}",
+                path.display()
+            );
             if let Some(mm) = mmproj {
                 println!("Multimodal projector (mmproj): {}", mm.display());
             }
@@ -326,6 +355,89 @@ async fn main() -> Result<()> {
                 for f in files {
                     println!("{:<45} {:>6} MB  ({})", f.filename, f.size_mb, f.path);
                 }
+            }
+        }
+        Commands::Scan {
+            model,
+            models_dir,
+            sha256,
+            expected_sha256,
+            json,
+        } => {
+            let dir = models_dir
+                .map(|p| expand_tilde(&p))
+                .unwrap_or_else(default_models_dir);
+            let expanded = expand_tilde(&model);
+            let target = if expanded.exists() {
+                expanded
+            } else {
+                let candidate = dir.join(&expanded);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    expanded
+                }
+            };
+            let report = scan_gguf_model(&target, sha256, expected_sha256.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let badge = match report.verdict {
+                    ScanVerdict::Pass => "PASS (AMAN)",
+                    ScanVerdict::Warn => "WARN (PERLU PERHATIAN)",
+                    ScanVerdict::Block => "BLOCK (BERBAHAYA / KORUP)",
+                };
+                println!("=== cmod Model Security Scan ===");
+                println!("  File         : {}", report.path);
+                println!(
+                    "  Ukuran       : {:.2} MB",
+                    report.file_size_bytes as f64 / 1_048_576.0
+                );
+                println!("  Status       : {badge} ({} ms)", report.scan_duration_ms);
+                if let Some(v) = report.gguf_version {
+                    println!(
+                        "  GGUF         : v{v} | tensors={} | metadata_kv={}",
+                        report.tensor_count.unwrap_or(0),
+                        report.metadata_kv_count.unwrap_or(0)
+                    );
+                }
+                if let Some(ref arch) = report.architecture {
+                    println!(
+                        "  Arsitektur   : {arch}{}",
+                        report
+                            .model_name
+                            .as_deref()
+                            .map(|n| format!(" ({n})"))
+                            .unwrap_or_default()
+                    );
+                }
+                if let Some(len) = report.chat_template_len {
+                    println!("  ChatTemplate : {len} bytes (diaudit)");
+                }
+                if let Some(ref h) = report.sha256 {
+                    let v = match report.sha256_verified {
+                        Some(true) => " [COCOK]",
+                        Some(false) => " [TIDAK COCOK!]",
+                        None => "",
+                    };
+                    println!("  SHA-256      : {h}{v}");
+                }
+                if report.findings.is_empty() {
+                    println!("  Temuan       : Tidak ada anomali keamanan ditemukan.");
+                } else {
+                    println!("  Temuan ({}):", report.findings.len());
+                    for f in &report.findings {
+                        let sev = match f.severity {
+                            ScanSeverity::Critical => "CRITICAL",
+                            ScanSeverity::Warning => "WARNING ",
+                            ScanSeverity::Info => "INFO    ",
+                        };
+                        println!("    - [{sev}] {}: {}", f.code, f.message);
+                    }
+                }
+            }
+            if !report.safe_to_load {
+                anyhow::bail!("Model ditolak oleh security scanner (verdict: BLOCK)");
             }
         }
         Commands::Presets => {
@@ -368,6 +480,8 @@ async fn main() -> Result<()> {
             cluster_nodes,
             rpc_servers,
             upstream_url,
+            verify_model,
+            require_sha256,
             llama_logs,
         } => {
             if llama_logs {
@@ -461,6 +575,30 @@ async fn main() -> Result<()> {
                     cfg.backend.manage_local_process = true;
                 }
             }
+            if (verify_model || require_sha256.is_some()) && !cfg.backend.model_path.is_empty() {
+                let target = std::path::Path::new(&cfg.backend.model_path);
+                let report = scan_gguf_model(target, false, require_sha256.as_deref())?;
+                info!(
+                    verdict = ?report.verdict,
+                    arch = ?report.architecture,
+                    ms = report.scan_duration_ms,
+                    findings = report.findings.len(),
+                    "Pre-load GGUF security scan selesai"
+                );
+                if !report.safe_to_load {
+                    let reasons: Vec<String> = report
+                        .findings
+                        .iter()
+                        .map(|f| format!("[{}] {}", f.code, f.message))
+                        .collect();
+                    anyhow::bail!(
+                        "Model diblokir sebelum dimuat ke engine ({}): {}",
+                        cfg.backend.model_path,
+                        reasons.join("; ")
+                    );
+                }
+            }
+
             if let Some(mm) = mmproj {
                 cfg.backend.mmproj_path = resolve_in_models_dir(&mm).display().to_string();
             }

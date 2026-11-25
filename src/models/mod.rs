@@ -6,7 +6,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 use crate::hardware::HardwareReport;
 
@@ -878,6 +880,22 @@ pub fn list_local_models(models_dir: &Path) -> Vec<LocalModelFile> {
     files
 }
 
+fn extract_hf_sha256(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for name in ["x-linked-etag", "etag"] {
+        if let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let cleaned = raw
+                .trim()
+                .trim_start_matches("W/")
+                .trim_matches('"')
+                .to_ascii_lowercase();
+            if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Some(cleaned);
+            }
+        }
+    }
+    None
+}
+
 async fn download_single_file<F>(
     client: &Client,
     url: &str,
@@ -911,6 +929,7 @@ where
         bail!("HTTP {} saat mengunduh {url}", resp.status());
     }
 
+    let expected_sha256 = extract_hf_sha256(resp.headers());
     let total = resp.content_length();
     let part_path = PathBuf::from(format!("{}.part", dest.display()));
     let mut file = tokio::fs::File::create(&part_path)
@@ -919,15 +938,63 @@ where
 
     let mut stream = resp.bytes_stream();
     let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
 
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res.context("error saat membaca stream unduhan")?;
+        hasher.update(&chunk);
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         on_progress(downloaded, total);
     }
     file.flush().await?;
     drop(file);
+
+    // 1. Verify on-the-fly SHA-256 against HuggingFace LFS header (if provided)
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if let Some(ref expected) = expected_sha256 {
+        if &actual_sha256 != expected {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            bail!(
+                "Verifikasi integritas SHA-256 GAGAL untuk {} (diharapkan {expected}, aktual {actual_sha256}). File unduhan dihapus.",
+                dest.display()
+            );
+        }
+    }
+
+    // 2. Automatic GGUF structural & chat_template security scan before installing
+    if dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+    {
+        let scan_path = part_path.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::scanner::scan_gguf_model(&scan_path, false, None)
+        })
+        .await
+        .context("security scan task panic")??;
+        if !report.safe_to_load {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            let reasons: Vec<String> = report
+                .findings
+                .iter()
+                .map(|f| format!("[{}] {}", f.code, f.message))
+                .collect();
+            bail!(
+                "Model diblokir oleh security scanner otomatis setelah unduh ({}): {}",
+                dest.display(),
+                reasons.join("; ")
+            );
+        }
+        info!(
+            file = %dest.display(),
+            verdict = ?report.verdict,
+            sha256 = %actual_sha256,
+            hf_sha256_verified = expected_sha256.is_some(),
+            "Unduhan model lolos verifikasi SHA-256 & security scan GGUF"
+        );
+    }
 
     tokio::fs::rename(&part_path, dest)
         .await

@@ -192,6 +192,53 @@ pub async fn local_models(State(state): State<AppState>, headers: HeaderMap) -> 
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanModelRequest {
+    pub filename: String,
+    #[serde(default)]
+    pub sha256: bool,
+    pub expected_sha256: Option<String>,
+}
+
+pub async fn scan_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ScanModelRequest>,
+) -> Response {
+    if !authorize(&headers, &state.config.server.api_keys) {
+        return unauthorized_json();
+    }
+    let name = body.filename.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Nama file model tidak valid" })),
+        )
+            .into_response();
+    }
+    let path = PathBuf::from(&state.config.backend.models_dir).join(name);
+    let compute_sha = body.sha256;
+    let expected = body.expected_sha256.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::scanner::scan_gguf_model(&path, compute_sha, expected.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PullModelRequest {
     pub id: String,
 }
