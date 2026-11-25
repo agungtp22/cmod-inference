@@ -408,6 +408,26 @@ pub fn curated_catalog() -> Vec<CatalogModel> {
             best_for: "Reasoning mendalam versi R1-0528 untuk audit klaim, analisis kebijakan, & verifikasi logika".to_string(),
         },
         CatalogModel {
+            id: "deepseek-r1-distill-qwen-14b".to_string(),
+            name: "DeepSeek-R1 Distill Qwen 14B Reasoning (Q4_K_M)".to_string(),
+            family: "DeepSeek-R1".to_string(),
+            architecture: "dense".to_string(),
+            total_params_b: 14.8,
+            active_params_b: 14.8,
+            quant: "Q4_K_M".to_string(),
+            multimodal: false,
+            non_thinking: false,
+            disk_mb: 8571,
+            min_vram_mb: 11500,
+            recommended_vram_mb: 15000,
+            min_ram_for_offload_mb: None,
+            filename: "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf".to_string(),
+            download_url: "https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-14B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf".to_string(),
+            mmproj_filename: None,
+            mmproj_url: None,
+            best_for: "DeepSeek-R1 14B reasoning & coding kuat yang nyaman di Apple Silicon 24 GB / GPU 16-24 GB".to_string(),
+        },
+        CatalogModel {
             id: "glm-4-9b-0414".to_string(),
             name: "GLM-4 9B 0414 (Q4_K_M)".to_string(),
             family: "GLM-4".to_string(),
@@ -880,20 +900,36 @@ pub fn list_local_models(models_dir: &Path) -> Vec<LocalModelFile> {
     files
 }
 
+/// Extract the official Git-LFS SHA-256 from HuggingFace's `X-Linked-ETag` header.
+/// Note: we MUST NOT fall back to the redirected CDN `ETag`, because HuggingFace Xet-Bridge
+/// serves a 64-hex Xet CAS Merkle hash in `ETag` rather than the file's SHA-256!
 fn extract_hf_sha256(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    for name in ["x-linked-etag", "etag"] {
-        if let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            let cleaned = raw
-                .trim()
-                .trim_start_matches("W/")
-                .trim_matches('"')
-                .to_ascii_lowercase();
-            if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Some(cleaned);
-            }
-        }
+    let raw = headers.get("x-linked-etag").and_then(|v| v.to_str().ok())?;
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    if cleaned.len() == 64 && cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(cleaned)
+    } else {
+        None
     }
-    None
+}
+
+/// Probe the origin URL with `HEAD` (no redirect) so we capture `X-Linked-ETag` from
+/// HuggingFace's initial 302 response before following the CDN redirect.
+async fn fetch_origin_sha256(url: &str, hf_token: Option<&str>) -> Option<String> {
+    let no_redirect_client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let mut req = no_redirect_client.head(url);
+    if let Some(tok) = hf_token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.ok()?;
+    extract_hf_sha256(resp.headers())
 }
 
 async fn download_single_file<F>(
@@ -914,11 +950,16 @@ where
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    let hf_token = std::env::var("HF_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let expected_sha256 = fetch_origin_sha256(url, hf_token.as_deref()).await;
+
     let mut req = client.get(url);
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        if !token.trim().is_empty() {
-            req = req.bearer_auth(token.trim());
-        }
+    if let Some(ref token) = hf_token {
+        req = req.bearer_auth(token);
     }
 
     let resp = req
@@ -929,7 +970,7 @@ where
         bail!("HTTP {} saat mengunduh {url}", resp.status());
     }
 
-    let expected_sha256 = extract_hf_sha256(resp.headers());
+    let expected_sha256 = expected_sha256.or_else(|| extract_hf_sha256(resp.headers()));
     let total = resp.content_length();
     let part_path = PathBuf::from(format!("{}.part", dest.display()));
     let mut file = tokio::fs::File::create(&part_path)
