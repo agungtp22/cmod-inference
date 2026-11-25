@@ -75,16 +75,13 @@ jobs:
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-13 g++-13 cuda-nvcc-12-6 cuda-cudart-dev-12-6 libcublas-dev-12-6
-          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
-          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
-          echo "CUDAToolkit_ROOT=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
-          echo "CUDAHOSTCXX=/usr/bin/g++-13" >> "$GITHUB_ENV"
-          echo "CC=/usr/bin/gcc-13" >> "$GITHUB_ENV"
-          echo "CXX=/usr/bin/g++-13" >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=/usr/local/cuda-12.6/lib64/stubs:/usr/local/cuda-12.6/lib64" >> "$GITHUB_ENV"
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-8 cuda-cudart-dev-12-8 libcublas-dev-12-8
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "CUDAToolkit_ROOT=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/usr/local/cuda-12.8/lib64/stubs:/usr/local/cuda-12.8/lib64" >> "$GITHUB_ENV"
           echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
-          /usr/local/cuda-12.6/bin/nvcc --version
+          /usr/local/cuda-12.8/bin/nvcc --version
 
       - name: Install AMD ROCm / HIP build dependencies
         if: runner.os == 'Linux' && matrix.accel == 'rocm'
@@ -138,7 +135,7 @@ jobs:
             cuda)
               DEB_PREFIX="cmod-inference-cuda"
               TAR_NAME="cmod-inference-linux-x86_64-cuda.tar.gz"
-              DESC_SUFFIX=" (NVIDIA CUDA 12.6: T4/L4/A100/H100/RTX)"
+              DESC_SUFFIX=" (NVIDIA CUDA 12.8: T4/L4/A100/H100/RTX)"
               EXTRA_DEPS=""
               ;;
             rocm)
