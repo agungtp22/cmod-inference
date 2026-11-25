@@ -19,30 +19,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: Linux x86_64 (Native CPU + Grammar + Multimodal)
+          - label: Linux x86_64 CPU (Native + Grammar + Multimodal)
             os: ubuntu-latest
             features: "native grammar multimodal"
             artifact: cmod-inference-linux-x86_64
             bin_name: cmod-inference
-            cuda: false
-          - label: Linux x86_64 CUDA (NVIDIA T4/L4/A100/RTX + Grammar + Multimodal)
+            accel: cpu
+          - label: Linux x86_64 CUDA (NVIDIA T4/L4/A100/H100/RTX)
             os: ubuntu-latest
             features: "cuda multimodal"
             artifact: cmod-inference-linux-x86_64-cuda
             bin_name: cmod-inference
-            cuda: true
+            accel: cuda
+          - label: Linux x86_64 ROCm (AMD Radeon/Instinct HIP)
+            os: ubuntu-latest
+            features: "rocm multimodal"
+            artifact: cmod-inference-linux-x86_64-rocm
+            bin_name: cmod-inference
+            accel: rocm
+          - label: Linux x86_64 Vulkan (Cross-Vendor AMD/Intel/NVIDIA)
+            os: ubuntu-latest
+            features: "vulkan multimodal"
+            artifact: cmod-inference-linux-x86_64-vulkan
+            bin_name: cmod-inference
+            accel: vulkan
           - label: macOS ARM64 (Native Metal + Multimodal)
             os: macos-15
             features: "metal multimodal"
             artifact: cmod-inference-macos-arm64
             bin_name: cmod-inference
-            cuda: false
+            accel: metal
           - label: Windows x86_64 (Native CPU + Grammar + Multimodal)
             os: windows-latest
             features: "native grammar multimodal"
             artifact: cmod-inference-windows-x86_64
             bin_name: cmod-inference.exe
-            cuda: false
+            accel: cpu
 
     steps:
       - uses: actions/checkout@v4
@@ -51,14 +63,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Linux build dependencies
+      - name: Install Linux base build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libclang-dev cmake ninja-build
 
       - name: Install NVIDIA CUDA Toolkit (minimal nvcc + cublas)
-        if: runner.os == 'Linux' && matrix.cuda == true
+        if: runner.os == 'Linux' && matrix.accel == 'cuda'
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
@@ -70,6 +82,20 @@ jobs:
           echo "LIBRARY_PATH=/usr/local/cuda-12.6/lib64/stubs:/usr/local/cuda-12.6/lib64" >> "$GITHUB_ENV"
           echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
           /usr/local/cuda-12.6/bin/nvcc --version
+
+      - name: Install AMD ROCm / HIP build dependencies
+        if: runner.os == 'Linux' && matrix.accel == 'rocm'
+        run: |
+          sudo apt-get install -y --no-install-recommends hipcc libhipblas-dev librocblas-dev
+          echo "HIP_PATH=/usr" >> "$GITHUB_ENV"
+          echo "AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx90a;gfx942" >> "$GITHUB_ENV"
+          hipcc --version
+
+      - name: Install Vulkan build dependencies
+        if: runner.os == 'Linux' && matrix.accel == 'vulkan'
+        run: |
+          sudo apt-get install -y --no-install-recommends libvulkan-dev glslc
+          glslc --version
 
       - name: Configure LLVM/Clang for Windows bindgen
         if: runner.os == 'Windows'
@@ -90,11 +116,11 @@ jobs:
           test "$ARCH" = "arm64"
 
       - name: Run unit & conformance tests
-        if: matrix.cuda != true
+        if: matrix.accel == 'cpu' || matrix.accel == 'metal'
         run: cargo test --features "${{ matrix.features }}"
 
-      - name: Compile tests (CUDA on GPU-less runner)
-        if: matrix.cuda == true
+      - name: Compile tests (GPU backend on GPU-less runner)
+        if: matrix.accel == 'cuda' || matrix.accel == 'rocm' || matrix.accel == 'vulkan'
         run: cargo test --no-run --features "${{ matrix.features }}"
 
       - name: Build release binary
@@ -105,15 +131,32 @@ jobs:
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
           mkdir -p dist
-          if [ "${{ matrix.cuda }}" = "true" ]; then
-            DEB_PREFIX="cmod-inference-cuda"
-            TAR_NAME="cmod-inference-linux-x86_64-cuda.tar.gz"
-            DESC_SUFFIX=" (NVIDIA CUDA 12.6: T4/L4/A100/H100/RTX)"
-          else
-            DEB_PREFIX="cmod-inference"
-            TAR_NAME="cmod-inference-linux-x86_64.tar.gz"
-            DESC_SUFFIX=""
-          fi
+          case "${{ matrix.accel }}" in
+            cuda)
+              DEB_PREFIX="cmod-inference-cuda"
+              TAR_NAME="cmod-inference-linux-x86_64-cuda.tar.gz"
+              DESC_SUFFIX=" (NVIDIA CUDA 12.6: T4/L4/A100/H100/RTX)"
+              EXTRA_DEPS=""
+              ;;
+            rocm)
+              DEB_PREFIX="cmod-inference-rocm"
+              TAR_NAME="cmod-inference-linux-x86_64-rocm.tar.gz"
+              DESC_SUFFIX=" (AMD ROCm HIP: Radeon RX 6000/7000 & Instinct)"
+              EXTRA_DEPS=""
+              ;;
+            vulkan)
+              DEB_PREFIX="cmod-inference-vulkan"
+              TAR_NAME="cmod-inference-linux-x86_64-vulkan.tar.gz"
+              DESC_SUFFIX=" (Cross-Vendor Vulkan GPU: AMD/Intel/NVIDIA)"
+              EXTRA_DEPS=", libvulkan1"
+              ;;
+            *)
+              DEB_PREFIX="cmod-inference"
+              TAR_NAME="cmod-inference-linux-x86_64.tar.gz"
+              DESC_SUFFIX=""
+              EXTRA_DEPS=""
+              ;;
+          esac
           # 1. Debian (.deb) installer
           PKG_DIR="target/deb/${DEB_PREFIX}_${VERSION}_amd64"
           mkdir -p "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/doc/cmod-inference"
@@ -128,7 +171,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Installed-Size: ${INSTALLED_SIZE}
-          Depends: libc6, libstdc++6, libgomp1
+          Depends: libc6, libstdc++6, libgomp1${EXTRA_DEPS}
           Maintainer: Agung Tri Pambudi <https://github.com/agungtp22/cmod-inference>
           Description: Standalone local AI inference server${DESC_SUFFIX}
            Single-binary Rust AI inference server with in-process llama.cpp,

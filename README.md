@@ -150,21 +150,7 @@ Measured head-to-head against **Ollama `v0.40.16`** using the **exact same GGUF 
 
 ## Build & Installation
 
-### Option 1: One-Line Installer (Recommended — Linux `.deb` CPU/CUDA & macOS ARM64)
-
-Automatically detects your OS and GPU (**NVIDIA CUDA** on Linux/Google Colab, **Apple Metal** on macOS ARM64, or **CPU**), verifies `SHA256SUMS.txt`, and installs the pre-built release package (`.deb` on Debian/Ubuntu/Colab):
-
-```bash
-# Install latest release (auto-detects NVIDIA CUDA vs CPU / macOS Metal)
-curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | sh
-
-# Pin a specific version or force CUDA / CPU
-curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | CMOD_VERSION=v0.1.0 sh
-curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | CMOD_ACCEL=cuda sh
-curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | CMOD_ACCEL=cpu sh
-```
-
-### Option 2: Pre-built Binaries (GitHub Releases & Actions)
+### Option 1: Pre-built Binaries (GitHub Actions)
 
 Every push to `main` automatically builds and publishes standalone release binaries on [GitHub Actions](https://github.com/agungtp22/cmod-inference/actions/workflows/ci.yml):
 
@@ -172,6 +158,8 @@ Every push to `main` automatically builds and publishes standalone release binar
 |---|---|---|---|
 | **macOS** | Apple Silicon (`arm64` only) | `metal` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-macos-arm64` |
 | **Linux CUDA (`.deb` + `.tar.gz`)** | `x86_64` (`amd64`, NVIDIA T4/L4/A100/H100/RTX) | `cuda` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64-cuda` |
+| **Linux ROCm (`.deb` + `.tar.gz`)** | `x86_64` (`amd64`, AMD Radeon RX 6000/7000 & Instinct) | `rocm` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64-rocm` |
+| **Linux Vulkan (`.deb` + `.tar.gz`)** | `x86_64` (`amd64`, Cross-Vendor AMD/Intel/NVIDIA) | `vulkan` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64-vulkan` |
 | **Linux CPU (`.deb` + `.tar.gz`)** | `x86_64` (`amd64`) | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64` |
 | **Windows** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-windows-x86_64` |
 

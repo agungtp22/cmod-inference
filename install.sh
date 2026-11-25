@@ -13,7 +13,7 @@ set -eu
 
 REPO="agungtp22/cmod-inference"
 VERSION="${CMOD_VERSION:-latest}"
-ACCEL="${CMOD_ACCEL:-auto}" # auto | cuda | cpu
+ACCEL="${CMOD_ACCEL:-auto}" # auto | cuda | rocm | vulkan | cpu
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -25,13 +25,21 @@ while [ "$#" -gt 0 ]; do
       ACCEL="cuda"
       shift
       ;;
+    --rocm)
+      ACCEL="rocm"
+      shift
+      ;;
+    --vulkan)
+      ACCEL="vulkan"
+      shift
+      ;;
     --cpu)
       ACCEL="cpu"
       shift
       ;;
     --help|-h)
-      echo "Usage: install.sh [--version vX.Y.Z] [--cuda | --cpu]"
-      echo "Env vars: CMOD_VERSION=latest|vX.Y.Z, CMOD_ACCEL=auto|cuda|cpu"
+      echo "Usage: install.sh [--version vX.Y.Z] [--cuda | --rocm | --vulkan | --cpu]"
+      echo "Env vars: CMOD_VERSION=latest|vX.Y.Z, CMOD_ACCEL=auto|cuda|rocm|vulkan|cpu"
       exit 0
       ;;
     *)
@@ -141,40 +149,63 @@ case "$OS" in
   Linux)
     [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ] || die "Linux pre-built package supports x86_64/amd64 only (detected: ${ARCH})."
 
-    # Detect NVIDIA CUDA GPU unless explicitly overridden
-    USE_CUDA=0
-    if [ "$ACCEL" = "cuda" ]; then
-      USE_CUDA=1
-    elif [ "$ACCEL" = "cpu" ]; then
-      USE_CUDA=0
-    else
-      if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-        USE_CUDA=1
-        log "NVIDIA GPU detected via nvidia-smi -> selecting CUDA build"
-      elif [ -e /dev/nvidia0 ]; then
-        USE_CUDA=1
-        log "NVIDIA GPU device detected (/dev/nvidia0) -> selecting CUDA build"
+    # Detect GPU accelerator (NVIDIA CUDA -> AMD ROCm -> Vulkan -> CPU) unless explicitly set
+    SELECTED_ACCEL="$ACCEL"
+    if [ "$SELECTED_ACCEL" = "auto" ]; then
+      if (command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1) || [ -e /dev/nvidia0 ]; then
+        SELECTED_ACCEL="cuda"
+        log "NVIDIA GPU detected -> selecting CUDA build"
+      elif (command -v rocm-smi >/dev/null 2>&1 && rocm-smi >/dev/null 2>&1) || [ -e /dev/kfd ]; then
+        SELECTED_ACCEL="rocm"
+        log "AMD ROCm GPU detected -> selecting ROCm build"
+      elif [ -e /dev/dri/renderD128 ] && (command -v vulkaninfo >/dev/null 2>&1 || [ -f /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ]); then
+        SELECTED_ACCEL="vulkan"
+        log "Vulkan-capable GPU detected -> selecting Vulkan build"
       else
-        log "No NVIDIA GPU detected -> selecting CPU build"
+        SELECTED_ACCEL="cpu"
+        log "No supported GPU detected -> selecting CPU build"
       fi
     fi
 
+    pick_linux_asset() {
+      pkg_kind="$1" # deb | tar
+      wanted="$2"
+      if [ "$pkg_kind" = "deb" ]; then
+        case "$wanted" in
+          cuda)   cand="cmod-inference-cuda_${VER_NUM}_amd64.deb" ;;
+          rocm)   cand="cmod-inference-rocm_${VER_NUM}_amd64.deb" ;;
+          vulkan) cand="cmod-inference-vulkan_${VER_NUM}_amd64.deb" ;;
+          *)      cand="cmod-inference_${VER_NUM}_amd64.deb" ;;
+        esac
+        fallback="cmod-inference_${VER_NUM}_amd64.deb"
+      else
+        case "$wanted" in
+          cuda)   cand="cmod-inference-linux-x86_64-cuda.tar.gz" ;;
+          rocm)   cand="cmod-inference-linux-x86_64-rocm.tar.gz" ;;
+          vulkan) cand="cmod-inference-linux-x86_64-vulkan.tar.gz" ;;
+          *)      cand="cmod-inference-linux-x86_64.tar.gz" ;;
+        esac
+        fallback="cmod-inference-linux-x86_64.tar.gz"
+      fi
+
+      if [ "$wanted" = "cpu" ]; then
+        printf "%s" "$fallback"
+        return 0
+      fi
+      if curl -fsI "${BASE_URL}/${cand}" >/dev/null 2>&1; then
+        printf "%s" "$cand"
+        return 0
+      fi
+      if [ "$ACCEL" != "auto" ]; then
+        die "Requested ${wanted} package (${cand}) is not available in release ${VERSION}."
+      fi
+      warn "${cand} not available in release ${VERSION}; falling back to CPU package (${fallback})."
+      printf "%s" "$fallback"
+    }
+
     if command -v dpkg >/dev/null 2>&1; then
       # Debian / Ubuntu / Google Colab -> install .deb package
-      if [ "$USE_CUDA" -eq 1 ]; then
-        CUDA_ASSET="cmod-inference-cuda_${VER_NUM}_amd64.deb"
-        if curl -fsI "${BASE_URL}/${CUDA_ASSET}" >/dev/null 2>&1; then
-          ASSET="$CUDA_ASSET"
-        else
-          if [ "$ACCEL" = "cuda" ]; then
-            die "CUDA package ${CUDA_ASSET} is not available in release ${VERSION}."
-          fi
-          warn "CUDA package ${CUDA_ASSET} not yet in release ${VERSION}; falling back to CPU .deb."
-          ASSET="cmod-inference_${VER_NUM}_amd64.deb"
-        fi
-      else
-        ASSET="cmod-inference_${VER_NUM}_amd64.deb"
-      fi
+      ASSET="$(pick_linux_asset deb "$SELECTED_ACCEL")"
 
       log "Downloading ${ASSET} (${VERSION})..."
       curl -fL --progress-bar "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
@@ -188,20 +219,7 @@ case "$OS" in
       fi
     else
       # Non-Debian Linux -> install .tar.gz
-      if [ "$USE_CUDA" -eq 1 ]; then
-        CUDA_ASSET="cmod-inference-linux-x86_64-cuda.tar.gz"
-        if curl -fsI "${BASE_URL}/${CUDA_ASSET}" >/dev/null 2>&1; then
-          ASSET="$CUDA_ASSET"
-        else
-          if [ "$ACCEL" = "cuda" ]; then
-            die "CUDA tarball ${CUDA_ASSET} is not available in release ${VERSION}."
-          fi
-          warn "CUDA tarball ${CUDA_ASSET} not yet in release ${VERSION}; falling back to CPU tarball."
-          ASSET="cmod-inference-linux-x86_64.tar.gz"
-        fi
-      else
-        ASSET="cmod-inference-linux-x86_64.tar.gz"
-      fi
+      ASSET="$(pick_linux_asset tar "$SELECTED_ACCEL")"
 
       log "Downloading ${ASSET} (${VERSION})..."
       curl -fL --progress-bar "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
