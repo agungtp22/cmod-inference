@@ -24,16 +24,25 @@ jobs:
             features: "native grammar multimodal"
             artifact: cmod-inference-linux-x86_64
             bin_name: cmod-inference
+            cuda: false
+          - label: Linux x86_64 CUDA (NVIDIA T4/L4/A100/RTX + Grammar + Multimodal)
+            os: ubuntu-latest
+            features: "cuda multimodal"
+            artifact: cmod-inference-linux-x86_64-cuda
+            bin_name: cmod-inference
+            cuda: true
           - label: macOS ARM64 (Native Metal + Multimodal)
             os: macos-15
             features: "metal multimodal"
             artifact: cmod-inference-macos-arm64
             bin_name: cmod-inference
+            cuda: false
           - label: Windows x86_64 (Native CPU + Grammar + Multimodal)
             os: windows-latest
             features: "native grammar multimodal"
             artifact: cmod-inference-windows-x86_64
             bin_name: cmod-inference.exe
+            cuda: false
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +56,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libclang-dev cmake ninja-build
+
+      - name: Install NVIDIA CUDA Toolkit (minimal nvcc + cublas)
+        if: runner.os == 'Linux' && matrix.cuda == true
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6 cuda-cudart-dev-12-6 libcublas-dev-12-6
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "CUDAToolkit_ROOT=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/usr/local/cuda-12.6/lib64/stubs:/usr/local/cuda-12.6/lib64" >> "$GITHUB_ENV"
+          echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
+          /usr/local/cuda-12.6/bin/nvcc --version
 
       - name: Configure LLVM/Clang for Windows bindgen
         if: runner.os == 'Windows'
@@ -67,7 +90,12 @@ jobs:
           test "$ARCH" = "arm64"
 
       - name: Run unit & conformance tests
+        if: matrix.cuda != true
         run: cargo test --features "${{ matrix.features }}"
+
+      - name: Compile tests (CUDA on GPU-less runner)
+        if: matrix.cuda == true
+        run: cargo test --no-run --features "${{ matrix.features }}"
 
       - name: Build release binary
         run: cargo build --release --features "${{ matrix.features }}"
@@ -77,8 +105,17 @@ jobs:
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
           mkdir -p dist
+          if [ "${{ matrix.cuda }}" = "true" ]; then
+            DEB_PREFIX="cmod-inference-cuda"
+            TAR_NAME="cmod-inference-linux-x86_64-cuda.tar.gz"
+            DESC_SUFFIX=" (NVIDIA CUDA 12.6: T4/L4/A100/H100/RTX)"
+          else
+            DEB_PREFIX="cmod-inference"
+            TAR_NAME="cmod-inference-linux-x86_64.tar.gz"
+            DESC_SUFFIX=""
+          fi
           # 1. Debian (.deb) installer
-          PKG_DIR="target/deb/cmod-inference_${VERSION}_amd64"
+          PKG_DIR="target/deb/${DEB_PREFIX}_${VERSION}_amd64"
           mkdir -p "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/doc/cmod-inference"
           install -m 755 target/release/cmod-inference "${PKG_DIR}/usr/bin/cmod-inference"
           ln -sf cmod-inference "${PKG_DIR}/usr/bin/cmod"
@@ -93,15 +130,15 @@ jobs:
           Installed-Size: ${INSTALLED_SIZE}
           Depends: libc6, libstdc++6, libgomp1
           Maintainer: Agung Tri Pambudi <https://github.com/agungtp22/cmod-inference>
-          Description: Standalone local AI inference server (OpenAI + Anthropic + 3-Tier KV-Cache)
+          Description: Standalone local AI inference server${DESC_SUFFIX}
            Single-binary Rust AI inference server with in-process llama.cpp,
            llguidance constrained JSON decoding, 3-Tier KV-Cache, GGUF security
            scanner, and embedded cmod Studio Web GUI.
           EOF
           dpkg-deb --build --root-owner-group "${PKG_DIR}"
-          cp "target/deb/cmod-inference_${VERSION}_amd64.deb" dist/
+          cp "target/deb/${DEB_PREFIX}_${VERSION}_amd64.deb" dist/
           # 2. Tarball
-          tar -czf "dist/cmod-inference-linux-x86_64.tar.gz" -C target/release cmod-inference
+          tar -czf "dist/${TAR_NAME}" -C target/release cmod-inference
           ls -lh dist/
 
       - name: Package macOS ARM64 (.tar.gz)

@@ -157,8 +157,8 @@ Every push to `main` automatically builds and publishes standalone release binar
 | Platform | Architecture | Included Features | Artifact Name |
 |---|---|---|---|
 | **macOS** | Apple Silicon (`arm64` only) | `metal` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-macos-arm64` |
-| **Linux (`.deb` installer)** | `x86_64` (`amd64`) | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64-deb` |
-| **Linux (raw binary)** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64` |
+| **Linux CUDA (`.deb` + `.tar.gz`)** | `x86_64` (`amd64`, NVIDIA T4/L4/A100/H100/RTX) | `cuda` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64-cuda` |
+| **Linux CPU (`.deb` + `.tar.gz`)** | `x86_64` (`amd64`) | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64` |
 | **Windows** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-windows-x86_64` |
 
 #### Download from GitHub Actions UI
