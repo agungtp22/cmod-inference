@@ -103,6 +103,7 @@ pub struct CanonicalRequest {
     pub stream: bool,
     pub priority: PriorityLane,
     pub prefix_hash: String,
+    pub tenant_id: String,
     pub assigned_slot: Option<u32>,
 }
 

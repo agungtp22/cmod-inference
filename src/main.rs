@@ -87,6 +87,10 @@ TIPS:
         #[arg(long)]
         api_key: Option<String>,
 
+        /// Daftar origin CORS yang diizinkan, pisah koma (contoh: https://app.company.com atau *; default: permissive di localhost, same-origin di 0.0.0.0/LAN)
+        #[arg(long, env = "CMOD_INFERENCE_CORS_ORIGINS")]
+        cors_origin: Option<String>,
+
         /// Jenis backend: native | mlx | cluster | llamacpp | vllm | passthrough
         #[arg(short, long)]
         backend: Option<String>,
@@ -339,6 +343,7 @@ async fn main() -> Result<()> {
             bind,
             port,
             api_key,
+            cors_origin,
             backend,
             model,
             model_path,
@@ -390,6 +395,16 @@ async fn main() -> Result<()> {
                     .collect();
                 if !keys.is_empty() {
                     cfg.server.api_keys = keys;
+                }
+            }
+            if let Some(co) = cors_origin {
+                let origins: Vec<String> = co
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !origins.is_empty() {
+                    cfg.server.cors_origins = origins;
                 }
             }
             if let Some(bk) = backend {

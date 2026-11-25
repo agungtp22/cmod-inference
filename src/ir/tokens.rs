@@ -192,6 +192,7 @@ mod tests {
             stream: false,
             priority: PriorityLane::Interactive,
             prefix_hash: String::new(),
+            tenant_id: "default".to_string(),
             assigned_slot: None,
         };
 

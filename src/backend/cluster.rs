@@ -313,6 +313,7 @@ mod tests {
             stream: false,
             priority: PriorityLane::Interactive,
             prefix_hash: prefix_hash.to_string(),
+            tenant_id: "default".to_string(),
             assigned_slot: None,
         }
     }

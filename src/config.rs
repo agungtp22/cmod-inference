@@ -78,6 +78,9 @@ pub struct ServerConfig {
     pub bind: String,
     pub port: u16,
     pub api_keys: Vec<String>,
+    /// Allowed CORS origins (e.g. `["https://app.company.com"]` or `["*"]`).
+    /// When empty: permissive on loopback (`127.0.0.1`), same-origin only on non-loopback (`0.0.0.0` / LAN IP).
+    pub cors_origins: Vec<String>,
     pub allow_unauthenticated_lan: bool,
     pub log_prompts: bool,
 }
@@ -88,10 +91,15 @@ impl Default for ServerConfig {
             bind: "127.0.0.1".to_string(),
             port: 8790,
             api_keys: Vec::new(),
+            cors_origins: Vec::new(),
             allow_unauthenticated_lan: false,
             log_prompts: false,
         }
     }
+}
+
+pub fn is_loopback_bind(bind: &str) -> bool {
+    matches!(bind.trim(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +244,16 @@ impl InferenceConfig {
                 .collect();
             if !keys.is_empty() {
                 self.server.api_keys = keys;
+            }
+        }
+        if let Ok(v) = std::env::var("CMOD_INFERENCE_CORS_ORIGINS") {
+            let origins: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !origins.is_empty() {
+                self.server.cors_origins = origins;
             }
         }
         if let Ok(v) = std::env::var("CMOD_INFERENCE_ALLOW_UNAUTH_LAN") {

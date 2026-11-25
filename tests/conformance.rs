@@ -218,6 +218,7 @@ async fn spawn_test_stack(
             bind: "127.0.0.1".to_string(),
             port: 0,
             api_keys,
+            cors_origins: Vec::new(),
             allow_unauthenticated_lan: false,
             log_prompts: false,
         },

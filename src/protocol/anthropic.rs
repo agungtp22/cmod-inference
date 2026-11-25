@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::auth::{authorize, extract_priority};
+use crate::auth::{authorize, extract_priority, resolve_tenant_id};
 use crate::ir::tokens::{auto_prune_old_tool_results, check_context_window, estimate_request_input_tokens};
 use crate::ir::{
     CanonicalMessage, CanonicalRequest, CanonicalStreamEvent, ContentPart, ResponseFormat, Role,
@@ -317,6 +317,7 @@ fn parse_anthropic_to_canonical(
         stream: req.stream,
         priority,
         prefix_hash,
+        tenant_id: "default".to_string(),
         assigned_slot: None,
     })
 }
@@ -362,6 +363,7 @@ pub async fn count_tokens(
         stream: false,
         priority: crate::ir::PriorityLane::Interactive,
         prefix_hash: String::new(),
+        tenant_id: "default".to_string(),
         assigned_slot: None,
     };
 
@@ -396,6 +398,7 @@ pub async fn messages(
                 return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
             }
         };
+    canonical.tenant_id = resolve_tenant_id(&headers, &state.config.server.api_keys);
 
     let pruned = auto_prune_old_tool_results(&mut canonical, state.config.backend.max_model_len);
     if pruned > 0 {

@@ -442,6 +442,7 @@ mod imp {
 
         let mut l1_tokens: Vec<LlamaToken> = Vec::new();
         let mut l1_valid = false;
+        let mut l1_tenant = String::new();
 
         while let Ok(job) = rx.recv() {
             let err_tx = job.tx.clone();
@@ -454,6 +455,7 @@ mod imp {
                     mtmd_ctx.as_mut(),
                     &mut l1_tokens,
                     &mut l1_valid,
+                    &mut l1_tenant,
                     job.req,
                     job.tx,
                 )
@@ -466,12 +468,14 @@ mod imp {
                     mtmd_ctx.as_mut(),
                     &mut l1_tokens,
                     &mut l1_valid,
+                    &mut l1_tenant,
                     job.req,
                     job.tx,
                 )
             };
             if let Err(err) = res {
                 l1_valid = false;
+                l1_tenant.clear();
                 let _ = err_tx.send(Err(err));
             }
         }
@@ -896,6 +900,39 @@ mod imp {
         a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
     }
 
+    /// Compute the exact token boundary right after `system + tools` (and before the first user turn)
+    /// in a template-agnostic way by comparing the formatted prompt against a sentinel user probe.
+    /// Guarantees `matched == snap.tokens.len()` on future threads with the same system+tools,
+    /// which is essential for hybrid/recurrent models (Qwen3.5/3.8 DeltaNet, Mamba, etc.) that
+    /// cannot rewind KV state mid-sequence.
+    fn compute_system_boundary_tokens(
+        model: &LlamaModel,
+        req: &CanonicalRequest,
+        prompt_tokens: &[LlamaToken],
+    ) -> Option<usize> {
+        if req.prefix_hash.is_empty() || prompt_tokens.len() <= 32 {
+            return None;
+        }
+        let mut probe_req = req.clone();
+        probe_req.messages = vec![crate::ir::CanonicalMessage {
+            role: Role::User,
+            parts: vec![ContentPart::Text {
+                text: "__CMOD_PREFIX_BOUNDARY_PROBE__".to_string(),
+            }],
+        }];
+        let probe_prompt = format_prompt(model, &probe_req).ok()?;
+        let probe_add_bos = !probe_prompt.starts_with("<s>");
+        let probe_tokens = model
+            .vocab()
+            .tokenize(probe_prompt.as_bytes(), probe_add_bos, true);
+        let boundary = common_prefix_len(prompt_tokens, &probe_tokens);
+        if boundary > 16 && boundary < prompt_tokens.len() {
+            Some(boundary)
+        } else {
+            None
+        }
+    }
+
     enum TargetSlot<'a, 'model> {
         Plain(&'a mut LlamaContext<'model>),
         Mtp(&'a mut MtpSpeculative<'model>),
@@ -917,6 +954,7 @@ mod imp {
         #[cfg(feature = "multimodal")] mut mtmd_ctx_opt: Option<&mut llama_cpp_2::mtmd::MtmdContext>,
         l1_tokens: &mut Vec<LlamaToken>,
         l1_valid: &mut bool,
+        l1_tenant: &mut String,
         req: CanonicalRequest,
         tx: mpsc::UnboundedSender<Result<CanonicalStreamEvent>>,
     ) -> Result<()> {
@@ -1056,6 +1094,7 @@ mod imp {
                 slot.ctx_mut().clear_kv_cache();
                 *l1_valid = false;
                 l1_tokens.clear();
+                l1_tenant.clear();
 
                 let mut bitmaps = Vec::with_capacity(raw_images.len());
                 for b64 in &raw_images {
@@ -1100,133 +1139,224 @@ mod imp {
             last_logit_idx = 0;
         }
 
-        let cache_key = format!("{}_{}", inner.model_fingerprint, req.prefix_hash);
+        // Partition L2 RAM & L3 Disk KV-Cache by tenant_id so different API keys / tenants
+        // never share or probe each other's prefix cache (default keeps legacy local key format).
+        let cache_key = if req.tenant_id.is_empty() || req.tenant_id == "default" {
+            format!("{}_{}", inner.model_fingerprint, req.prefix_hash)
+        } else {
+            format!(
+                "{}_{}_{}",
+                inner.model_fingerprint, req.tenant_id, req.prefix_hash
+            )
+        };
         let mut should_persist_kv = false;
+        let mut boundary_snapshot: Option<NativeKvSnapshot> = None;
 
         if !used_mtmd {
+            // Compute how many tokens match in L1 VRAM (strictly same tenant).
+            let l1_matched = if *l1_valid
+                && *l1_tenant == req.tenant_id
+                && !l1_tokens.is_empty()
+                && prompt_tokens.len() > 16
+            {
+                let m = common_prefix_len(l1_tokens, &prompt_tokens);
+                if m > 16 && m < prompt_tokens.len() {
+                    m
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
 
-            // Tier 1 (L1 VRAM Hot Hit): reuse prefix already resident in this worker's VRAM.
-            // Note: `clear_kv_cache_seq` returns `Ok(false)` on hybrid recurrent models (e.g. Qwen3.5/MiMo DeltaNet)
-            // when partial rollback isn't supported; we MUST check `Ok(true)` (or exact continuation).
-            if *l1_valid && !l1_tokens.is_empty() && prompt_tokens.len() > 16 {
-                let matched = common_prefix_len(l1_tokens, &prompt_tokens);
-                if matched > 16 && matched < prompt_tokens.len() {
-                    let can_reuse = matched == l1_tokens.len()
-                        || matches!(
-                            slot.ctx_mut()
-                                .clear_kv_cache_seq(Some(0), Some(matched as u32), None),
-                            Ok(true)
-                        );
-                    if can_reuse {
-                        cached_prefix_tokens = matched;
-                        inner.kv_cache.record_l1_hit();
+            // Check if L2 Host RAM has a strictly longer prefix match than L1 VRAM
+            // (critical when a single VRAM slot alternates between main agent & subagent threads
+            // that only share a ~25-token template header in L1 while L2 holds a 14k-token snapshot!).
+            let l2_candidate = if !req.prefix_hash.is_empty() && prompt_tokens.len() > 16 {
+                inner.kv_cache.get_ram(&cache_key).and_then(|snap| {
+                    let m = common_prefix_len(&snap.tokens, &prompt_tokens);
+                    if m > 16 && m < prompt_tokens.len() && m > l1_matched {
+                        Some((snap, m))
+                    } else {
+                        None
                     }
+                })
+            } else {
+                None
+            };
+
+            let disk_path_opt = if !req.prefix_hash.is_empty() && prompt_tokens.len() > 16 {
+                inner
+                    .kv_cache
+                    .disk_path_for_key(&cache_key)
+                    .filter(|p| p.exists())
+            } else {
+                None
+            };
+
+            // Tier 1 (L1 VRAM Hot Hit): use L1 when no longer L2 snapshot exists AND
+            // either L1 matched a substantial prefix (>= 128 tok) or no L3 disk snapshot exists.
+            if l2_candidate.is_none() && l1_matched > 0 && (l1_matched >= 128 || disk_path_opt.is_none()) {
+                let can_reuse = l1_matched == l1_tokens.len()
+                    || matches!(
+                        slot.ctx_mut()
+                            .clear_kv_cache_seq(Some(0), Some(l1_matched as u32), None),
+                        Ok(true)
+                    );
+                if can_reuse {
+                    cached_prefix_tokens = l1_matched;
+                    inner.kv_cache.record_l1_hit();
                 }
             }
 
             // Tier 2 (L2 Host RAM) & Tier 3 (L3 NVMe Disk)
             if cached_prefix_tokens == 0 {
                 slot.ctx_mut().clear_kv_cache();
-                if !req.prefix_hash.is_empty() && prompt_tokens.len() > 16 {
-                    if let Some(snap) = inner.kv_cache.get_ram(&cache_key) {
-                        let matched = common_prefix_len(&snap.tokens, &prompt_tokens);
-                        if matched > 16 && matched < prompt_tokens.len() {
-                            if slot.ctx_mut().state_seq_set(&snap.state, 0).is_ok()
-                                && (matched == snap.tokens.len()
-                                    || matches!(
-                                        slot.ctx_mut().clear_kv_cache_seq(
-                                            Some(0),
-                                            Some(matched as u32),
-                                            None
-                                        ),
-                                        Ok(true)
-                                    ))
+                if let Some((snap, matched)) = l2_candidate {
+                    if slot.ctx_mut().state_seq_set(&snap.state, 0).is_ok()
+                        && (matched == snap.tokens.len()
+                            || matches!(
+                                slot.ctx_mut().clear_kv_cache_seq(
+                                    Some(0),
+                                    Some(matched as u32),
+                                    None
+                                ),
+                                Ok(true)
+                            ))
+                    {
+                        cached_prefix_tokens = matched;
+                        inner.kv_cache.record_l2_hit();
+                    } else {
+                        slot.ctx_mut().clear_kv_cache();
+                    }
+                } else if let Some(disk_path) = disk_path_opt {
+                    if let Ok((disk_tokens, _)) = slot.ctx_mut().state_seq_load_file(
+                        &disk_path,
+                        0,
+                        inner.max_model_len as usize,
+                    ) {
+                        let matched = common_prefix_len(&disk_tokens, &prompt_tokens);
+                        if matched > 16
+                            && matched < prompt_tokens.len()
+                            && (matched == disk_tokens.len()
+                                || matches!(
+                                    slot.ctx_mut().clear_kv_cache_seq(
+                                        Some(0),
+                                        Some(matched as u32),
+                                        None
+                                    ),
+                                    Ok(true)
+                                ))
+                        {
+                            cached_prefix_tokens = matched;
+                            inner.kv_cache.record_l3_hit();
+                            if let Ok(state) = slot
+                                .ctx_mut()
+                                .state_seq_get(0, LlamaStateSeqFlags::empty())
                             {
-                                cached_prefix_tokens = matched;
-                                inner.kv_cache.record_l2_hit();
-                            } else {
-                                slot.ctx_mut().clear_kv_cache();
+                                inner.kv_cache.put_ram(
+                                    cache_key.clone(),
+                                    NativeKvSnapshot {
+                                        state,
+                                        tokens: disk_tokens[..matched].to_vec(),
+                                    },
+                                );
                             }
-                        }
-                    } else if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
-                        if disk_path.exists() {
-                            if let Ok((disk_tokens, _)) = slot.ctx_mut().state_seq_load_file(
-                                &disk_path,
-                                0,
-                                inner.max_model_len as usize,
-                            ) {
-                                let matched = common_prefix_len(&disk_tokens, &prompt_tokens);
-                                if matched > 16
-                                    && matched < prompt_tokens.len()
-                                    && (matched == disk_tokens.len()
-                                        || matches!(
-                                            slot.ctx_mut().clear_kv_cache_seq(
-                                                Some(0),
-                                                Some(matched as u32),
-                                                None
-                                            ),
-                                            Ok(true)
-                                        ))
-                                {
-                                    cached_prefix_tokens = matched;
-                                    inner.kv_cache.record_l3_hit();
-                                    if let Ok(state) = slot
-                                        .ctx_mut()
-                                        .state_seq_get(0, LlamaStateSeqFlags::empty())
-                                    {
-                                        inner.kv_cache.put_ram(
-                                            cache_key.clone(),
-                                            NativeKvSnapshot {
-                                                state,
-                                                tokens: disk_tokens[..matched].to_vec(),
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    slot.ctx_mut().clear_kv_cache();
-                                }
-                            }
+                        } else {
+                            slot.ctx_mut().clear_kv_cache();
                         }
                     }
-                    if cached_prefix_tokens == 0 {
-                        inner.kv_cache.record_miss();
-                    }
+                }
+                if cached_prefix_tokens == 0 && !req.prefix_hash.is_empty() && prompt_tokens.len() > 16 {
+                    inner.kv_cache.record_miss();
                 }
             }
 
             let total_prompt = prompt_tokens.len();
+            let sys_boundary = if cached_prefix_tokens < 128 {
+                compute_system_boundary_tokens(&inner.model, &req, &prompt_tokens)
+                    .filter(|&b| b > cached_prefix_tokens)
+            } else {
+                None
+            };
             let mut prefill_start = cached_prefix_tokens;
             let mut retried_clean = false;
             loop {
                 let mut prefill_ok = true;
-                for chunk_start in (prefill_start..total_prompt).step_by(batch_cap) {
-                    batch.clear();
-                    let chunk_end = (chunk_start + batch_cap).min(total_prompt);
-                    for (offset, &tok) in prompt_tokens[chunk_start..chunk_end].iter().enumerate() {
-                        let pos = (chunk_start + offset) as i32;
-                        let is_last = pos as usize == total_prompt - 1;
-                        batch.add(tok, pos, &[0], is_last)?;
+                boundary_snapshot = None;
+                let capture_at = sys_boundary.filter(|&b| b > prefill_start);
+                // Split prefill cleanly at `capture_at` (end of system+tools) when doing a cold
+                // prefill so we capture the exact recurrent/KV state before user_1 tokens run.
+                let segments: [(usize, usize); 2] = match capture_at {
+                    Some(b) => [(prefill_start, b), (b, total_prompt)],
+                    None => [(prefill_start, total_prompt), (total_prompt, total_prompt)],
+                };
+                let mut mtp_begun = false;
+                'prefill: for (seg_idx, (seg_start, seg_end)) in segments.into_iter().enumerate() {
+                    if seg_start >= seg_end {
+                        continue;
                     }
-                    if let Err(err) = slot.ctx_mut().decode(&mut batch) {
-                        if prefill_start > 0 && !retried_clean {
-                            warn!(
-                                cached = prefill_start,
-                                "Prefill gagal setelah reuse KV-cache ({err}); retry clean prefill dari 0"
-                            );
-                            slot.ctx_mut().clear_kv_cache();
-                            cached_prefix_tokens = 0;
-                            prefill_start = 0;
-                            retried_clean = true;
-                            prefill_ok = false;
-                            break;
+                    for chunk_start in (seg_start..seg_end).step_by(batch_cap) {
+                        batch.clear();
+                        let chunk_end = (chunk_start + batch_cap).min(seg_end);
+                        for (offset, &tok) in prompt_tokens[chunk_start..chunk_end].iter().enumerate()
+                        {
+                            let pos = (chunk_start + offset) as i32;
+                            let is_last = pos as usize == total_prompt - 1;
+                            batch.add(tok, pos, &[0], is_last)?;
                         }
-                        return Err(err).context("gagal prefill prompt");
+                        if let Err(err) = slot.ctx_mut().decode(&mut batch) {
+                            if prefill_start > 0 && !retried_clean {
+                                warn!(
+                                    cached = prefill_start,
+                                    "Prefill gagal setelah reuse KV-cache ({err}); retry clean prefill dari 0"
+                                );
+                                slot.ctx_mut().clear_kv_cache();
+                                cached_prefix_tokens = 0;
+                                prefill_start = 0;
+                                retried_clean = true;
+                                prefill_ok = false;
+                                break 'prefill;
+                            }
+                            return Err(err).context("gagal prefill prompt");
+                        }
+                        if let TargetSlot::Mtp(ref mut mtp) = slot {
+                            if !mtp_begun {
+                                let _ = mtp.begin(&prompt_tokens[..chunk_end]);
+                                mtp_begun = true;
+                            }
+                            let _ = mtp.process(&batch);
+                        }
                     }
-                    if let TargetSlot::Mtp(ref mut mtp) = slot {
-                        if chunk_start == prefill_start {
-                            let _ = mtp.begin(&prompt_tokens[..chunk_end]);
+                    // Capture Snapshot #1 right at the exact system+tools boundary:
+                    // - In-memory SeqState for L2 RAM (flushed into LRU after response Done)
+                    // - Native llama.cpp session file on L3 Disk (written once per unique system+tools hash)
+                    if seg_idx == 0 {
+                        if let Some(b) = capture_at {
+                            let boundary_tokens = prompt_tokens[..b].to_vec();
+                            if let Ok(state) = slot
+                                .ctx_mut()
+                                .state_seq_get(0, LlamaStateSeqFlags::empty())
+                            {
+                                boundary_snapshot = Some(NativeKvSnapshot {
+                                    state,
+                                    tokens: boundary_tokens.clone(),
+                                });
+                            }
+                            if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
+                                if !disk_path.exists() {
+                                    if let Err(err) = slot.ctx_mut().state_seq_save_file(
+                                        &disk_path,
+                                        0,
+                                        &boundary_tokens,
+                                    ) {
+                                        warn!("gagal menyimpan L3 KV-cache boundary snapshot: {err}");
+                                    } else {
+                                        inner.kv_cache.enforce_disk_budget();
+                                    }
+                                }
+                            }
                         }
-                        let _ = mtp.process(&batch);
                     }
                 }
                 if prefill_ok {
@@ -1236,12 +1366,16 @@ mod imp {
 
             // Defer L2 RAM & L3 Disk persistence until AFTER response Done is flushed to client
             // (Quick Win #4: eliminates Run 1 disk-write latency penalty on the user-facing path).
-            if cached_prefix_tokens == 0 && !req.prefix_hash.is_empty() && total_prompt > 32 {
+            if (cached_prefix_tokens == 0 || boundary_snapshot.is_some())
+                && !req.prefix_hash.is_empty()
+                && total_prompt > 32
+            {
                 should_persist_kv = true;
             }
 
             *l1_tokens = prompt_tokens.clone();
             *l1_valid = true;
+            *l1_tenant = req.tenant_id.clone();
             n_cur = total_prompt as i32;
             last_logit_idx = batch.n_tokens() - 1;
         }
@@ -1694,35 +1828,39 @@ mod imp {
         drop(tx);
 
         // Post-response L2 Host RAM & L3 NVMe Disk KV-Cache persistence (off the client critical path).
-        // Only trim & save when `clear_kv_cache_seq` returns `Ok(true)` (pure attention KV-cache);
-        // on hybrid recurrent models (DeltaNet/Mamba), save the full sequence without partial trim.
+        // When Snapshot #1 (exact system+tools boundary) was captured during prefill, we only
+        // insert it into L2 RAM here and leave L1 VRAM 100% intact for instant Turn 2 L1 hits!
         if should_persist_kv && *l1_valid {
-            let ctx = slot.ctx_mut();
-            let prompt_len = prompt_tokens.len();
-            let trimmed = matches!(
-                ctx.clear_kv_cache_seq(Some(0), Some(prompt_len as u32), None),
-                Ok(true)
-            );
-            let saved_tokens = if trimmed {
-                l1_tokens.truncate(prompt_len);
-                prompt_tokens.clone()
+            if let Some(snap) = boundary_snapshot {
+                inner.kv_cache.put_ram(cache_key.clone(), snap);
             } else {
-                l1_tokens.clone()
-            };
-            if let Ok(state) = ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
-                inner.kv_cache.put_ram(
-                    cache_key.clone(),
-                    NativeKvSnapshot {
-                        state,
-                        tokens: saved_tokens.clone(),
-                    },
+                let ctx = slot.ctx_mut();
+                let prompt_len = prompt_tokens.len();
+                let trimmed = matches!(
+                    ctx.clear_kv_cache_seq(Some(0), Some(prompt_len as u32), None),
+                    Ok(true)
                 );
-            }
-            if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
-                if let Err(err) = ctx.state_seq_save_file(&disk_path, 0, &saved_tokens) {
-                    warn!("gagal menyimpan L3 KV-cache disk: {err}");
+                let saved_tokens = if trimmed {
+                    l1_tokens.truncate(prompt_len);
+                    prompt_tokens.clone()
                 } else {
-                    inner.kv_cache.enforce_disk_budget();
+                    l1_tokens.clone()
+                };
+                if let Ok(state) = ctx.state_seq_get(0, LlamaStateSeqFlags::empty()) {
+                    inner.kv_cache.put_ram(
+                        cache_key.clone(),
+                        NativeKvSnapshot {
+                            state,
+                            tokens: saved_tokens.clone(),
+                        },
+                    );
+                }
+                if let Some(disk_path) = inner.kv_cache.disk_path_for_key(&cache_key) {
+                    if let Err(err) = ctx.state_seq_save_file(&disk_path, 0, &saved_tokens) {
+                        warn!("gagal menyimpan L3 KV-cache disk: {err}");
+                    } else {
+                        inner.kv_cache.enforce_disk_budget();
+                    }
                 }
             }
         }

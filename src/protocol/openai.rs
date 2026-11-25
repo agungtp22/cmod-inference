@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::auth::{authorize, extract_priority};
+use crate::auth::{authorize, extract_priority, resolve_tenant_id};
 use crate::ir::tokens::{auto_prune_old_tool_results, check_context_window};
 use crate::ir::{
     parse_data_image_url, CanonicalMessage, CanonicalRequest, CanonicalStreamEvent, ContentPart,
@@ -300,6 +300,7 @@ fn parse_openai_to_canonical(
         stream: req.stream,
         priority,
         prefix_hash,
+        tenant_id: "default".to_string(),
         assigned_slot: None,
     })
 }
@@ -447,6 +448,7 @@ pub async fn chat_completions(
             );
         }
     };
+    canonical.tenant_id = resolve_tenant_id(&headers, &state.config.server.api_keys);
 
     let pruned = auto_prune_old_tool_results(&mut canonical, state.config.backend.max_model_len);
     if pruned > 0 {
