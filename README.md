@@ -150,7 +150,21 @@ Measured head-to-head against **Ollama `v0.40.16`** using the **exact same GGUF 
 
 ## Build & Installation
 
-### Option 1: Pre-built Binaries (GitHub Actions)
+### Option 1: One-Line Installer (Recommended — Linux `.deb` CPU/CUDA & macOS ARM64)
+
+Automatically detects your OS and GPU (**NVIDIA CUDA** on Linux/Google Colab, **Apple Metal** on macOS ARM64, or **CPU**), verifies `SHA256SUMS.txt`, and installs the pre-built release package (`.deb` on Debian/Ubuntu/Colab):
+
+```bash
+# Install latest release (auto-detects NVIDIA CUDA vs CPU / macOS Metal)
+curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | sh
+
+# Pin a specific version or force CUDA / CPU
+curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | CMOD_VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | CMOD_ACCEL=cuda sh
+curl -fsSL https://raw.githubusercontent.com/agungtp22/cmod-inference/main/install.sh | CMOD_ACCEL=cpu sh
+```
+
+### Option 2: Pre-built Binaries (GitHub Releases & Actions)
 
 Every push to `main` automatically builds and publishes standalone release binaries on [GitHub Actions](https://github.com/agungtp22/cmod-inference/actions/workflows/ci.yml):
 
