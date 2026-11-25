@@ -71,6 +71,41 @@ jobs:
       - name: Build release binary
         run: cargo build --release --features "${{ matrix.features }}"
 
+      - name: Build Debian (.deb) installer package (Linux x86_64)
+        if: runner.os == 'Linux'
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)
+          PKG_DIR="target/deb/cmod-inference_${VERSION}_amd64"
+          mkdir -p "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/doc/cmod-inference"
+          install -m 755 target/release/cmod-inference "${PKG_DIR}/usr/bin/cmod-inference"
+          ln -sf cmod-inference "${PKG_DIR}/usr/bin/cmod"
+          install -m 644 README.md "${PKG_DIR}/usr/share/doc/cmod-inference/README.md"
+          INSTALLED_SIZE=$(du -sk "${PKG_DIR}/usr" | cut -f1)
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: cmod-inference
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Installed-Size: ${INSTALLED_SIZE}
+          Depends: libc6, libstdc++6, libgomp1
+          Maintainer: Agung Tri Pambudi <https://github.com/agungtp22/cmod-inference>
+          Description: Standalone local AI inference server (OpenAI + Anthropic + 3-Tier KV-Cache)
+           Single-binary Rust AI inference server with in-process llama.cpp,
+           llguidance constrained JSON decoding, 3-Tier KV-Cache, GGUF security
+           scanner, and embedded cmod Studio Web GUI.
+          EOF
+          dpkg-deb --build --root-owner-group "${PKG_DIR}"
+          ls -lh "target/deb/cmod-inference_${VERSION}_amd64.deb"
+
+      - name: Upload Debian (.deb) installer artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmod-inference-linux-x86_64-deb
+          path: target/deb/cmod-inference_*_amd64.deb
+          if-no-files-found: error
+
       - name: Upload release binary artifact
         uses: actions/upload-artifact@v4
         with:

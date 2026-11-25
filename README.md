@@ -157,7 +157,8 @@ Every push to `main` automatically builds and publishes standalone release binar
 | Platform | Architecture | Included Features | Artifact Name |
 |---|---|---|---|
 | **macOS** | Apple Silicon (`arm64` only) | `metal` + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-macos-arm64` |
-| **Linux** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64` |
+| **Linux (`.deb` installer)** | `x86_64` (`amd64`) | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64-deb` |
+| **Linux (raw binary)** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-linux-x86_64` |
 | **Windows** | `x86_64` | `native` (CPU) + `grammar` (`llguidance`) + `multimodal` (`mtmd`) | `cmod-inference-windows-x86_64` |
 
 #### Download from GitHub Actions UI
@@ -193,7 +194,14 @@ export PATH="$HOME/.local/bin:$PATH"
 cmod --version
 ```
 
-**Linux (x86_64):**
+**Linux — Debian / Ubuntu (`.deb` installer, recommended):**
+```bash
+unzip cmod-inference-linux-x86_64-deb.zip -d /tmp/cmod-deb
+sudo apt install -y /tmp/cmod-deb/cmod-inference_*_amd64.deb
+cmod --version
+```
+
+**Linux — Raw Binary (other distros):**
 ```bash
 unzip cmod-inference-linux-x86_64.zip -d /tmp/cmod-bin
 mkdir -p ~/.local/bin
