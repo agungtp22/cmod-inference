@@ -212,7 +212,7 @@ pub async fn scan_model(
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Nama file model tidak valid" })),
+            Json(json!({ "error": "Invalid model filename" })),
         )
             .into_response();
     }

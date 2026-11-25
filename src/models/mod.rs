@@ -956,7 +956,7 @@ where
         if &actual_sha256 != expected {
             let _ = tokio::fs::remove_file(&part_path).await;
             bail!(
-                "Verifikasi integritas SHA-256 GAGAL untuk {} (diharapkan {expected}, aktual {actual_sha256}). File unduhan dihapus.",
+                "SHA-256 integrity verification FAILED for {} (expected {expected}, actual {actual_sha256}). Downloaded file was removed.",
                 dest.display()
             );
         }
@@ -973,7 +973,7 @@ where
             crate::scanner::scan_gguf_model(&scan_path, false, None)
         })
         .await
-        .context("security scan task panic")??;
+        .context("security scan task panicked")??;
         if !report.safe_to_load {
             let _ = tokio::fs::remove_file(&part_path).await;
             let reasons: Vec<String> = report
@@ -982,7 +982,7 @@ where
                 .map(|f| format!("[{}] {}", f.code, f.message))
                 .collect();
             bail!(
-                "Model diblokir oleh security scanner otomatis setelah unduh ({}): {}",
+                "Model blocked by automatic post-download security scanner ({}): {}",
                 dest.display(),
                 reasons.join("; ")
             );
@@ -992,7 +992,7 @@ where
             verdict = ?report.verdict,
             sha256 = %actual_sha256,
             hf_sha256_verified = expected_sha256.is_some(),
-            "Unduhan model lolos verifikasi SHA-256 & security scan GGUF"
+            "Downloaded model passed SHA-256 verification and GGUF security scan"
         );
     }
 

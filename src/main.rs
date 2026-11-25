@@ -222,20 +222,20 @@ TIPS:
         #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
         models_dir: Option<PathBuf>,
     },
-    /// Audit keamanan file model .gguf (struktur biner, tensor bounds, chat_template SSTI/injection, & SHA-256)
+    /// Security audit for a .gguf model file (binary structure, tensor bounds, chat_template SSTI/injection, & SHA-256)
     Scan {
-        /// Path atau nama file .gguf (otomatis dicari di ~/.cmod/models jika hanya nama file)
+        /// Path or filename of the .gguf model (auto-resolved in ~/.cmod/models when only a filename is given)
         model: PathBuf,
-        /// Folder penyimpanan model lokal (default: ~/.cmod/models)
+        /// Local models directory (default: ~/.cmod/models)
         #[arg(long, env = "CMOD_INFERENCE_MODELS_DIR")]
         models_dir: Option<PathBuf>,
-        /// Hitung checksum SHA-256 penuh file model
+        /// Compute full SHA-256 checksum of the model file
         #[arg(long)]
         sha256: bool,
-        /// Verifikasi SHA-256 file terhadap hash yang diharapkan (keluar error jika tidak cocok)
+        /// Verify file SHA-256 against an expected official checksum (exits with error on mismatch)
         #[arg(long)]
         expected_sha256: Option<String>,
-        /// Tampilkan hasil audit dalam format JSON
+        /// Output audit report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -383,14 +383,14 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 let badge = match report.verdict {
-                    ScanVerdict::Pass => "PASS (AMAN)",
-                    ScanVerdict::Warn => "WARN (PERLU PERHATIAN)",
-                    ScanVerdict::Block => "BLOCK (BERBAHAYA / KORUP)",
+                    ScanVerdict::Pass => "PASS (SAFE)",
+                    ScanVerdict::Warn => "WARN (REVIEW RECOMMENDED)",
+                    ScanVerdict::Block => "BLOCK (UNSAFE / CORRUPTED)",
                 };
                 println!("=== cmod Model Security Scan ===");
                 println!("  File         : {}", report.path);
                 println!(
-                    "  Ukuran       : {:.2} MB",
+                    "  Size         : {:.2} MB",
                     report.file_size_bytes as f64 / 1_048_576.0
                 );
                 println!("  Status       : {badge} ({} ms)", report.scan_duration_ms);
@@ -403,7 +403,7 @@ async fn main() -> Result<()> {
                 }
                 if let Some(ref arch) = report.architecture {
                     println!(
-                        "  Arsitektur   : {arch}{}",
+                        "  Architecture : {arch}{}",
                         report
                             .model_name
                             .as_deref()
@@ -412,20 +412,24 @@ async fn main() -> Result<()> {
                     );
                 }
                 if let Some(len) = report.chat_template_len {
-                    println!("  ChatTemplate : {len} bytes (diaudit)");
+                    println!("  ChatTemplate : {len} bytes (audited)");
                 }
                 if let Some(ref h) = report.sha256 {
                     let v = match report.sha256_verified {
-                        Some(true) => " [COCOK]",
-                        Some(false) => " [TIDAK COCOK!]",
-                        None => "",
+                        Some(true) => " [VERIFIED]",
+                        Some(false) => " [MISMATCH!]",
+                        None => " (computed; pass --expected-sha256 <hash> to verify against official checksum)",
                     };
                     println!("  SHA-256      : {h}{v}");
+                } else {
+                    println!(
+                        "  SHA-256      : Not verified (pass --sha256 to compute, or --expected-sha256 <hash> to verify integrity)"
+                    );
                 }
                 if report.findings.is_empty() {
-                    println!("  Temuan       : Tidak ada anomali keamanan ditemukan.");
+                    println!("  Findings     : No security anomalies detected.");
                 } else {
-                    println!("  Temuan ({}):", report.findings.len());
+                    println!("  Findings ({}):", report.findings.len());
                     for f in &report.findings {
                         let sev = match f.severity {
                             ScanSeverity::Critical => "CRITICAL",
@@ -437,7 +441,7 @@ async fn main() -> Result<()> {
                 }
             }
             if !report.safe_to_load {
-                anyhow::bail!("Model ditolak oleh security scanner (verdict: BLOCK)");
+                anyhow::bail!("Model rejected by security scanner (verdict: BLOCK)");
             }
         }
         Commands::Presets => {

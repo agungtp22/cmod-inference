@@ -76,13 +76,13 @@ fn read_u64<R: Read>(r: &mut R) -> std::io::Result<u64> {
 }
 
 fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
-    let len = read_u64(r).context("gagal membaca panjang string GGUF")?;
+    let len = read_u64(r).context("failed to read GGUF string length")?;
     if len > MAX_SANE_STRING_LEN {
-        anyhow::bail!("panjang string GGUF tidak wajar ({len} byte > batas aman)");
+        anyhow::bail!("excessive GGUF string length ({len} bytes > safety limit)");
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)
-        .context("EOF tak terduga saat membaca string GGUF")?;
+        .context("unexpected EOF while reading GGUF string")?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -110,7 +110,7 @@ fn skip_gguf_value<R: Read + Seek>(r: &mut R, vtype: u32) -> Result<Option<Strin
             let elem_type = read_u32(r)?;
             let count = read_u64(r)?;
             if count > MAX_SANE_ARRAY_LEN {
-                anyhow::bail!("panjang array metadata GGUF tidak wajar ({count} elemen)");
+                anyhow::bail!("excessive GGUF metadata array length ({count} elements)");
             }
             // Fast-skip fixed-width primitive arrays in O(1) seek
             let fixed_elem_size: Option<u64> = match elem_type {
@@ -123,7 +123,7 @@ fn skip_gguf_value<R: Read + Seek>(r: &mut R, vtype: u32) -> Result<Option<Strin
             if let Some(sz) = fixed_elem_size {
                 let total = count
                     .checked_mul(sz)
-                    .ok_or_else(|| anyhow::anyhow!("overflow ukuran array metadata GGUF"))?;
+                    .ok_or_else(|| anyhow::anyhow!("GGUF metadata array size overflow"))?;
                 r.seek(SeekFrom::Current(total as i64))?;
             } else {
                 for _ in 0..count {
@@ -137,7 +137,7 @@ fn skip_gguf_value<R: Read + Seek>(r: &mut R, vtype: u32) -> Result<Option<Strin
             r.seek(SeekFrom::Current(8))?;
             Ok(None)
         }
-        other => anyhow::bail!("tipe nilai metadata GGUF tidak dikenal: {other}"),
+        other => anyhow::bail!("unknown GGUF metadata value type: {other}"),
     }
 }
 
@@ -156,10 +156,10 @@ fn detect_disguised_format(magic: &[u8]) -> Option<&'static str> {
         return Some("Windows PE executable (.exe/.dll)");
     }
     if magic.len() >= 4 && &magic[..4] == b"PK\x03\x04" {
-        return Some("ZIP / PyTorch archive (berpotensi mengandung Python pickle)");
+        return Some("ZIP / PyTorch archive (may contain unsafe Python pickle)");
     }
     if magic.len() >= 2 && magic[0] == 0x80 && (2..=5).contains(&magic[1]) {
-        return Some("Python Pickle binary (risiko Remote Code Execution)");
+        return Some("Python Pickle binary (Remote Code Execution risk)");
     }
     None
 }
@@ -186,22 +186,22 @@ fn audit_chat_template(template: &str, findings: &mut Vec<ScanFinding>) {
                 severity: ScanSeverity::Critical,
                 code: "TEMPLATE_SSTI_PATTERN".to_string(),
                 message: format!(
-                    "Ditemukan pola berbahaya di tokenizer.chat_template: {desc}"
+                    "Dangerous pattern detected in tokenizer.chat_template: {desc}"
                 ),
             });
         }
     }
 
     const SUSPICIOUS_PATTERNS: &[(&str, &str)] = &[
-        ("http://", "URL eksternal `http://` di dalam chat_template"),
-        ("https://", "URL eksternal `https://` di dalam chat_template"),
-        ("curl ", "Perintah `curl` di dalam chat_template"),
-        ("wget ", "Perintah `wget` di dalam chat_template"),
-        ("bash -c", "Perintah `bash -c` di dalam chat_template"),
-        ("/bin/sh", "Referensi `/bin/sh` di dalam chat_template"),
+        ("http://", "External URL `http://` inside chat_template"),
+        ("https://", "External URL `https://` inside chat_template"),
+        ("curl ", "Shell command `curl` inside chat_template"),
+        ("wget ", "Shell command `wget` inside chat_template"),
+        ("bash -c", "Shell command `bash -c` inside chat_template"),
+        ("/bin/sh", "Reference to `/bin/sh` inside chat_template"),
         (
             "ignore previous instructions",
-            "Indikasi hidden prompt injection di chat_template",
+            "Possible hidden prompt injection inside chat_template",
         ),
     ];
 
@@ -210,7 +210,7 @@ fn audit_chat_template(template: &str, findings: &mut Vec<ScanFinding>) {
             findings.push(ScanFinding {
                 severity: ScanSeverity::Warning,
                 code: "TEMPLATE_SUSPICIOUS_CONTENT".to_string(),
-                message: format!("Peringatan pada tokenizer.chat_template: {desc}"),
+                message: format!("Suspicious content in tokenizer.chat_template: {desc}"),
             });
         }
     }
@@ -218,7 +218,7 @@ fn audit_chat_template(template: &str, findings: &mut Vec<ScanFinding>) {
 
 pub fn compute_file_sha256(path: &Path) -> Result<String> {
     let file = File::open(path)
-        .with_context(|| format!("Gagal membuka file untuk SHA-256: {}", path.display()))?;
+        .with_context(|| format!("Failed to open file for SHA-256: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -245,9 +245,9 @@ pub fn scan_gguf_model(
 ) -> Result<ModelScanReport> {
     let started = std::time::Instant::now();
     let meta = std::fs::metadata(path)
-        .with_context(|| format!("File model tidak ditemukan: {}", path.display()))?;
+        .with_context(|| format!("Model file not found: {}", path.display()))?;
     if !meta.is_file() {
-        anyhow::bail!("Path bukan file reguler: {}", path.display());
+        anyhow::bail!("Path is not a regular file: {}", path.display());
     }
     let file_size = meta.len();
     let mut findings: Vec<ScanFinding> = Vec::new();
@@ -280,7 +280,7 @@ pub fn scan_gguf_model(
         findings.push(ScanFinding {
             severity: ScanSeverity::Critical,
             code: "INVALID_GGUF_HEADER".to_string(),
-            message: "File terlalu kecil atau tidak memiliki header GGUF yang valid.".to_string(),
+            message: "File is too small or missing a valid GGUF header.".to_string(),
         });
     } else if &magic != GGUF_MAGIC {
         if let Some(disguised) = detect_disguised_format(&magic) {
@@ -288,7 +288,7 @@ pub fn scan_gguf_model(
                 severity: ScanSeverity::Critical,
                 code: "DISGUISED_EXECUTABLE_OR_PICKLE".to_string(),
                 message: format!(
-                    "BAHAYA: File bukan GGUF, terdeteksi sebagai {disguised}!"
+                    "DANGER: File is not GGUF — detected as {disguised}!"
                 ),
             });
         } else {
@@ -296,7 +296,7 @@ pub fn scan_gguf_model(
                 severity: ScanSeverity::Critical,
                 code: "INVALID_GGUF_HEADER".to_string(),
                 message: format!(
-                    "Magic bytes bukan 'GGUF' (ditemukan: {:02x?}).",
+                    "Magic bytes are not 'GGUF' (found: {:02x?}).",
                     magic
                 ),
             });
@@ -310,7 +310,7 @@ pub fn scan_gguf_model(
                 severity: ScanSeverity::Critical,
                 code: "UNSUPPORTED_GGUF_VERSION".to_string(),
                 message: format!(
-                    "Versi GGUF tidak didukung atau korup: v{version} (hanya v2/v3)."
+                    "Unsupported or corrupted GGUF version: v{version} (only v2/v3 supported)."
                 ),
             });
         } else {
@@ -324,7 +324,7 @@ pub fn scan_gguf_model(
                     severity: ScanSeverity::Critical,
                     code: "HEADER_COUNT_OVERFLOW".to_string(),
                     message: format!(
-                        "Jumlah tensor ({tensor_count}) atau metadata KV ({kv_count}) melampaui batas aman."
+                        "Tensor count ({tensor_count}) or metadata KV count ({kv_count}) exceeds safety limits."
                     ),
                 });
             } else {
@@ -338,7 +338,7 @@ pub fn scan_gguf_model(
                             findings.push(ScanFinding {
                                 severity: ScanSeverity::Critical,
                                 code: "CORRUPT_METADATA".to_string(),
-                                message: format!("Metadata GGUF rusak: {err}"),
+                                message: format!("Corrupted GGUF metadata: {err}"),
                             });
                             parse_failed = true;
                             break;
@@ -350,7 +350,7 @@ pub fn scan_gguf_model(
                             findings.push(ScanFinding {
                                 severity: ScanSeverity::Critical,
                                 code: "CORRUPT_METADATA".to_string(),
-                                message: format!("Tipe metadata rusak pada key '{key}': {err}"),
+                                message: format!("Corrupted metadata type on key '{key}': {err}"),
                             });
                             parse_failed = true;
                             break;
@@ -381,7 +381,7 @@ pub fn scan_gguf_model(
                             findings.push(ScanFinding {
                                 severity: ScanSeverity::Critical,
                                 code: "CORRUPT_METADATA".to_string(),
-                                message: format!("Nilai metadata rusak pada key '{key}': {err}"),
+                                message: format!("Corrupted metadata value on key '{key}': {err}"),
                             });
                             parse_failed = true;
                             break;
@@ -399,7 +399,7 @@ pub fn scan_gguf_model(
                                 findings.push(ScanFinding {
                                     severity: ScanSeverity::Critical,
                                     code: "CORRUPT_TENSOR_TABLE".to_string(),
-                                    message: format!("Nama tensor #{idx} rusak: {err}"),
+                                    message: format!("Corrupted tensor #{idx} name: {err}"),
                                 });
                                 parse_failed = true;
                                 break;
@@ -411,7 +411,7 @@ pub fn scan_gguf_model(
                                 findings.push(ScanFinding {
                                     severity: ScanSeverity::Critical,
                                     code: "CORRUPT_TENSOR_TABLE".to_string(),
-                                    message: format!("Dimensi tensor #{idx} rusak: {err}"),
+                                    message: format!("Corrupted tensor #{idx} dimensions: {err}"),
                                 });
                                 parse_failed = true;
                                 break;
@@ -422,7 +422,7 @@ pub fn scan_gguf_model(
                                 severity: ScanSeverity::Critical,
                                 code: "INVALID_TENSOR_DIMS".to_string(),
                                 message: format!(
-                                    "Tensor #{idx} memiliki n_dims={n_dims} (> 8, tidak wajar)."
+                                    "Tensor #{idx} has invalid n_dims={n_dims} (> 8)."
                                 ),
                             });
                             parse_failed = true;
@@ -441,7 +441,7 @@ pub fn scan_gguf_model(
                                     severity: ScanSeverity::Critical,
                                     code: "INVALID_TENSOR_DIMS".to_string(),
                                     message: format!(
-                                        "Tensor #{idx} memiliki ukuran dimensi tidak wajar ({dim})."
+                                        "Tensor #{idx} has invalid dimension size ({dim})."
                                     ),
                                 });
                                 parse_failed = true;
@@ -457,7 +457,7 @@ pub fn scan_gguf_model(
                                 severity: ScanSeverity::Critical,
                                 code: "INVALID_TENSOR_TYPE".to_string(),
                                 message: format!(
-                                    "Tensor #{idx} memakai ggml_type tidak dikenal ({ggml_type})."
+                                    "Tensor #{idx} uses unknown ggml_type ({ggml_type})."
                                 ),
                             });
                             parse_failed = true;
@@ -483,7 +483,7 @@ pub fn scan_gguf_model(
                                 severity: ScanSeverity::Critical,
                                 code: "TENSOR_OUT_OF_BOUNDS".to_string(),
                                 message: format!(
-                                    "Offset tensor melampaui ukuran file ({} > {} byte) — berpotensi truncated atau crafted exploit.",
+                                    "Tensor offset exceeds file size ({} > {} bytes) — file may be truncated or crafted.",
                                     data_start.saturating_add(max_rel_offset),
                                     file_size
                                 ),
@@ -507,7 +507,7 @@ pub fn scan_gguf_model(
                     severity: ScanSeverity::Critical,
                     code: "SHA256_MISMATCH".to_string(),
                     message: format!(
-                        "Integritas SHA-256 TIDAK COCOK! Diharapkan: {expected_clean}, Aktual: {actual}"
+                        "SHA-256 integrity MISMATCH! Expected: {expected_clean}, Actual: {actual}"
                     ),
                 });
             }
