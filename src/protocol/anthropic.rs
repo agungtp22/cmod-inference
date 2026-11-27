@@ -417,13 +417,17 @@ pub async fn messages(
         }
     };
 
-    canonical.assigned_slot = Some(state.scheduler.assign_slot(&canonical.prefix_hash));
-    let permit = match state.scheduler.acquire(canonical.priority).await {
-        Ok(p) => p,
+    let (permit, assigned_slot) = match state
+        .scheduler
+        .acquire_with_slot(canonical.priority, &canonical.prefix_hash)
+        .await
+    {
+        Ok(pair) => pair,
         Err(msg) => {
             return anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg);
         }
     };
+    canonical.assigned_slot = Some(assigned_slot);
 
     if canonical.stream {
         let fallback_id = canonical.request_id.clone();

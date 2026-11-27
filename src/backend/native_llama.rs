@@ -1380,8 +1380,11 @@ mod imp {
             last_logit_idx = batch.n_tokens() - 1;
         }
 
-        let prefill_ms = req_started.elapsed().as_millis();
-        let decode_started = std::time::Instant::now();
+        // Capture true TTFT (prefill_ms) & start decode timing right after the FIRST output token
+        // is sampled so asynchronous GPU backends (notably Apple Metal when uncached <= 512)
+        // finish prefill synchronization before `prefill_ms` is recorded and `decode_tps` starts.
+        let mut prefill_ms_first_tok: Option<u128> = None;
+        let mut decode_started_after_first: Option<std::time::Instant> = None;
         let mut sampler = build_sampler(inner, &req, forced_tool_schema.as_ref());
         let starts_in_think =
             prompt.ends_with("<think>\n") || prompt.ends_with("<|channel>thought\n");
@@ -1427,13 +1430,17 @@ mod imp {
             }
         }
 
-        let emit_token = |token: LlamaToken,
+        let mut emit_token = |token: LlamaToken,
                               utf8_buf: &mut Vec<u8>,
                               accumulated: &mut String,
                               parser: &mut NativeOutputParser,
                               output_count: &mut u64,
                               stop_reason: &mut StopReason|
          -> Option<bool> {
+            if *output_count == 0 {
+                prefill_ms_first_tok = Some(req_started.elapsed().as_millis());
+                decode_started_after_first = Some(std::time::Instant::now());
+            }
             let piece = vocab.token_to_piece(token, true, None);
             utf8_buf.extend_from_slice(&piece);
             *output_count += 1;
@@ -1800,14 +1807,26 @@ mod imp {
             }
         }
 
-        let decode_secs = decode_started.elapsed().as_secs_f64().max(0.001);
-        let decode_tps = output_count as f64 / decode_secs;
+        let prefill_ms = prefill_ms_first_tok.unwrap_or_else(|| req_started.elapsed().as_millis());
+        let decode_tokens = output_count.saturating_sub(1);
+        let decode_tps = if decode_tokens > 0 {
+            let decode_secs = decode_started_after_first
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.001)
+                .max(0.001);
+            decode_tokens as f64 / decode_secs
+        } else if output_count == 1 {
+            1000.0 / (prefill_ms.max(1) as f64)
+        } else {
+            0.0
+        };
         let spec_acc_pct = if spec_drafted > 0 {
             format!("{:.0}%", (spec_accepted as f64 / spec_drafted as f64) * 100.0)
         } else {
             "off".to_string()
         };
         info!(
+            slot = req.assigned_slot.unwrap_or(0),
             model = %inner.model_id,
             in_tok = input_count,
             cached_tok = cached_prefix_tokens,
